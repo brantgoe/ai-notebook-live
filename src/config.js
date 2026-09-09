@@ -9,6 +9,7 @@ function settings() {
   const c = cfg();
   return {
     provider: c.get('provider', 'auto'),
+    claudePath: (c.get('claudePath', '') || '').trim(),
     model: c.get('model', 'claude-opus-5'),
     effort: c.get('effort', 'medium'),
     maxTokens: c.get('maxTokens', 8000),

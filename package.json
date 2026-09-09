@@ -215,6 +215,12 @@
           "type": "number",
           "default": 37417,
           "description": "Port for the localhost agent bridge. Use 0 to pick a free port."
+        },
+        "aiNotebookLive.claudePath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Absolute path to the `claude` executable. Leave empty to search the usual locations. Run `which claude` in a terminal to find it.\n\nMachine-scoped: a workspace cannot set this, because the value is executed."
         }
       }
     }

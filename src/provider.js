@@ -16,68 +16,140 @@ class ProviderError extends Error {
   }
 }
 
-async function storedApiKey(secrets) {
-  const fromStore = secrets ? await secrets.get(SECRET_KEY) : undefined;
-  return (
-    fromStore ||
-    process.env.ANTHROPIC_API_KEY ||
-    process.env.ANTHROPIC_AUTH_TOKEN ||
-    undefined
-  );
+// The secret store is a keychain round trip, and on a locked keyring it can
+// raise a password prompt - so it is read once and invalidated by event.
+let secretCache = { valid: false, value: undefined };
+
+function invalidateSecretCache() {
+  secretCache = { valid: false, value: undefined };
 }
 
-function claudeBinary() {
-  if (process.env.CLAUDE_CODE_EXECPATH) return process.env.CLAUDE_CODE_EXECPATH;
-  const candidates = [
-    path.join(os.homedir(), '.local', 'bin', 'claude'),
-    '/usr/local/bin/claude',
-    '/opt/homebrew/bin/claude',
-  ];
-  for (const candidate of candidates) {
+async function storedApiKey(secrets) {
+  if (!secretCache.valid) {
+    secretCache = { valid: true, value: secrets ? await secrets.get(SECRET_KEY) : undefined };
+  }
+  // Environment variables are re-read every time: they cost nothing and a
+  // terminal-launched window can pick them up mid-session.
+  if (secretCache.value) return { key: secretCache.value, source: 'secret' };
+  if (process.env.ANTHROPIC_API_KEY) return { key: process.env.ANTHROPIC_API_KEY, source: 'env' };
+  if (process.env.ANTHROPIC_AUTH_TOKEN) {
+    return { key: process.env.ANTHROPIC_AUTH_TOKEN, source: 'env' };
+  }
+  return { key: undefined, source: 'none' };
+}
+
+// The PATH scan stats every directory on PATH, so it is cached - but on a TTL,
+// not forever: someone who is told to install the CLI must not have to reload
+// the window afterwards.
+const CLI_TTL_MS = 30_000;
+let cliCache = { at: 0, hint: null, found: false, binary: undefined, source: 'none' };
+
+function candidatePaths(explicit) {
+  const home = os.homedir();
+  const paths = [];
+  if (explicit) paths.push([explicit, 'setting']);
+  if (process.env.CLAUDE_CODE_EXECPATH) paths.push([process.env.CLAUDE_CODE_EXECPATH, 'env']);
+  paths.push([path.join(home, '.local', 'bin', 'claude'), 'local']);
+  paths.push(['/usr/local/bin/claude', 'usr-local']);
+  paths.push([path.join(home, '.claude', 'local', 'claude'), 'claude-local']);
+  paths.push(['/opt/homebrew/bin/claude', 'homebrew']);
+  paths.push(['/home/linuxbrew/.linuxbrew/bin/claude', 'linuxbrew']);
+  paths.push([path.join(home, '.bun', 'bin', 'claude'), 'bun']);
+  // nvm keeps npm globals under a per-version directory, so a CLI installed
+  // there is invisible unless that exact Node version is active.
+  try {
+    const versions = path.join(home, '.nvm', 'versions', 'node');
+    for (const v of fs.readdirSync(versions)) {
+      paths.push([path.join(versions, v, 'bin', 'claude'), 'nvm']);
+    }
+  } catch {
+    /* no nvm */
+  }
+  return paths;
+}
+
+function locateClaude(explicit) {
+  const hint = explicit || null;
+  if (cliCache.hint === hint && Date.now() - cliCache.at < CLI_TTL_MS) return cliCache;
+  let found = false;
+  let binary;
+  let source = 'none';
+  for (const [candidate, why] of candidatePaths(explicit)) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
+      found = true;
+      binary = candidate;
+      source = why;
+      break;
     } catch {
       /* keep looking */
     }
   }
-  return 'claude';
-}
-
-function claudeCliAvailable() {
-  const bin = claudeBinary();
-  if (bin !== 'claude') return true;
-  const dirs = (process.env.PATH || '').split(path.delimiter);
-  return dirs.some((dir) => {
-    try {
-      fs.accessSync(path.join(dir, 'claude'), fs.constants.X_OK);
-      return true;
-    } catch {
-      return false;
+  if (!found) {
+    for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+      try {
+        const candidate = path.join(dir, 'claude');
+        fs.accessSync(candidate, fs.constants.X_OK);
+        found = true;
+        binary = candidate;
+        source = 'path';
+        break;
+      } catch {
+        /* keep looking */
+      }
     }
-  });
+  }
+  cliCache = { at: Date.now(), hint, found, binary, source };
+  return cliCache;
 }
 
-/** Decides which backend to use for this request. */
+function invalidateCliCache() {
+  cliCache.at = 0;
+}
+
+function claudeBinary(explicit) {
+  return locateClaude(explicit).binary || 'claude';
+}
+
+/**
+ * Decides which backend to use, and proves it is usable.
+ *
+ * Callers must run this BEFORE touching the notebook: resolving it late is what
+ * used to let a missing API key blank a user's cell.
+ */
 async function resolveProvider(opts, secrets) {
-  const key = await storedApiKey(secrets);
+  const { key, source } = await storedApiKey(secrets);
+  const where = source === 'secret' ? 'the VS Code secret store' : 'an environment variable';
+
   if (opts.provider === 'api') {
     if (!key) {
-      throw new ProviderError('No Anthropic API key is configured.', { action: 'setKey' });
+      throw new ProviderError(
+        'aiNotebookLive.provider is set to "api", but no API key is stored. Add a key, or set it back to "auto" to use your Claude Code login.',
+        { action: 'setKey' }
+      );
     }
-    return { kind: 'api', key };
+    return { kind: 'api', key, source, label: `Anthropic API - key from ${where}` };
   }
+
   if (opts.provider === 'claude-cli') {
-    if (!claudeCliAvailable()) {
-      throw new ProviderError('The `claude` CLI was not found on PATH.', { action: 'install' });
+    const cli = locateClaude(opts.claudePath);
+    if (!cli.found) {
+      throw new ProviderError(
+        'Could not find the `claude` command. If Claude Code is installed, run `which claude` in a terminal and put that path in aiNotebookLive.claudePath.',
+        { action: 'install' }
+      );
     }
-    return { kind: 'cli' };
+    return { kind: 'cli', binary: cli.binary, source: cli.source, label: `Claude Code CLI - ${cli.binary}` };
   }
-  if (key) return { kind: 'api', key };
-  if (claudeCliAvailable()) return { kind: 'cli' };
+
+  if (key) return { kind: 'api', key, source, label: `Anthropic API - key from ${where}` };
+  const cli = locateClaude(opts.claudePath);
+  if (cli.found) {
+    return { kind: 'cli', binary: cli.binary, source: cli.source, label: `Claude Code CLI - ${cli.binary}` };
+  }
   throw new ProviderError(
-    'No Anthropic API key and no `claude` CLI found. Set a key, or install Claude Code.',
-    { action: 'setKey' }
+    'AI Notebook Live needs either Claude Code (uses your existing Claude login, no API key) or an Anthropic API key.',
+    { action: 'install' }
   );
 }
 
@@ -85,11 +157,14 @@ async function resolveProvider(opts, secrets) {
  * Streams a completion into onText(chunk).
  * Resolves with { provider, model, stopReason, refused }.
  */
-async function stream({ system, user, opts, secrets, token, onText }) {
-  const target = await resolveProvider(opts, secrets);
+async function stream({ target, system, user, opts, token, onText }) {
+  // The target is resolved by the caller, before any notebook edit. Taking it
+  // as a parameter means this function structurally cannot fail on a missing
+  // key half-way through writing a cell.
+  if (!target) throw new Error('stream() requires a resolved provider target.');
   return target.kind === 'api'
     ? streamApi({ system, user, opts, token, onText, apiKey: target.key })
-    : streamCli({ system, user, opts, token, onText });
+    : streamCli({ system, user, opts, token, onText, binary: target.binary });
 }
 
 async function streamApi({ system, user, opts, token, onText, apiKey }) {
@@ -164,8 +239,8 @@ function apiError(err) {
  * Uses the local `claude` CLI in print mode, so the extension works off an
  * existing Claude Code login with no API key.
  */
-function streamCli({ system, user, opts, token, onText }) {
-  const bin = claudeBinary();
+function streamCli({ system, user, opts, token, onText, binary }) {
+  const bin = binary || claudeBinary(opts.claudePath);
   const args = [
     '--print',
     '--output-format',
@@ -281,4 +356,12 @@ function streamCli({ system, user, opts, token, onText }) {
   });
 }
 
-module.exports = { stream, resolveProvider, ProviderError, SECRET_KEY, storedApiKey };
+module.exports = {
+  stream,
+  resolveProvider,
+  ProviderError,
+  SECRET_KEY,
+  storedApiKey,
+  invalidateSecretCache,
+  invalidateCliCache,
+};

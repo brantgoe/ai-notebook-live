@@ -522,15 +522,43 @@ test('provider selection falls back to the claude CLI with no API key', async ()
       () => providerModule.resolveProvider({ provider: 'api' }, secrets),
       (err) => err instanceof providerModule.ProviderError && err.action === 'setKey'
     );
-    const auto = await providerModule.resolveProvider({ provider: 'auto' }, secrets);
+    // process.execPath stands in for the CLI: it is guaranteed to exist and be
+    // executable on any machine, so this no longer passes only where the author
+    // happens to have Claude Code installed.
+    const auto = await providerModule.resolveProvider(
+      { provider: 'auto', claudePath: process.execPath },
+      secrets
+    );
     assert.strictEqual(auto.kind, 'cli', 'the local claude CLI should be used when no key is set');
+    assert.strictEqual(auto.binary, process.execPath, 'claudePath wins over the search list');
+    assert.match(auto.label, /Claude Code CLI/, 'the target carries a human-readable label');
 
+    // The secret store is read once and cached, so swapping it out mid-test has
+    // to announce itself - exactly as storing or clearing a key does at runtime.
+    providerModule.invalidateSecretCache();
     const withKey = await providerModule.resolveProvider(
       { provider: 'auto' },
       { get: async () => 'sk-ant-test' }
     );
     assert.strictEqual(withKey.kind, 'api');
     assert.strictEqual(withKey.key, 'sk-ant-test');
+    assert.match(withKey.label, /secret store/, 'the label names where the key came from');
+
+    // ...and without that announcement the cached answer stands, which is the
+    // whole point of the cache: one keychain round trip per change, not per cell.
+    let reads = 0;
+    const counting = {
+      get: async () => {
+        reads += 1;
+        return 'sk-ant-test';
+      },
+    };
+    providerModule.invalidateSecretCache();
+    await providerModule.resolveProvider({ provider: 'auto' }, counting);
+    await providerModule.resolveProvider({ provider: 'auto' }, counting);
+    await providerModule.resolveProvider({ provider: 'auto' }, counting);
+    assert.strictEqual(reads, 1, 'three commands must cost one secret-store read');
+    providerModule.invalidateSecretCache();
   } finally {
     if (saved[0] !== undefined) process.env.ANTHROPIC_API_KEY = saved[0];
     if (saved[1] !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = saved[1];
@@ -561,6 +589,118 @@ test('activate registers exactly the commands the manifest contributes', async (
   }
   assert.ok(context.subscriptions.length >= contributed.length);
   await extension.deactivate();
+});
+
+test('a provider failure leaves the notebook byte-identical', async () => {
+  // The headline of the preflight work. Previously reviseCell blanked the cell
+  // and only THEN discovered there was no way to reach a model, so the single
+  // likeliest first-run failure destroyed whatever the user had written.
+  const extension = require(path.join('..', 'extension.js'));
+  const notebook = newNotebook(['answer = 42  # took me all afternoon']);
+  const before = notebook.getCells().map((c) => c.document.getText());
+
+  const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+  vscode.window.visibleNotebookEditors.push(editor);
+  vscode.window.activeNotebookEditor = editor;
+
+  // Force a provider that cannot possibly resolve: api mode with no key.
+  vscode.__test.config.set('aiNotebookLive.provider', 'api');
+  vscode.__test.inputs.push('make it handle bad input');
+  vscode.__test.shown.length = 0;
+  vscode.__test.commands.clear();
+  vscode.__test.edits = 0;
+
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  extension.activate(context);
+  try {
+    await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+    // generate() would create a cell before streaming, so it is the command
+    // that actually proves the preflight runs first.
+    vscode.__test.inputs.push('plot a histogram');
+    await vscode.__test.commands.get('aiNotebookLive.generate')();
+
+    assert.deepStrictEqual(
+      notebook.getCells().map((c) => c.document.getText()),
+      before,
+      'not one character of the notebook may change when no provider is available'
+    );
+    assert.strictEqual(notebook.cellCount, 1, 'and no stray cell is left behind');
+    // The invariant the preflight actually buys: not that the damage is undone,
+    // but that no edit is ever attempted. Undoing damage is phase 1's job.
+    assert.strictEqual(
+      vscode.__test.edits,
+      0,
+      'no workspace edit may be applied before the provider is known to work'
+    );
+
+    const errors = vscode.__test.shown.filter((e) => e.kind === 'error');
+    assert.strictEqual(errors.length, 2, 'both commands tell the user what went wrong');
+    assert.match(errors[0].message, /api key/i);
+    assert.ok(
+      errors[0].items.includes('Set API Key'),
+      'and is offered something to do about it, not just a log'
+    );
+  } finally {
+    await extension.deactivate();
+    vscode.__test.config.clear();
+    vscode.window.activeNotebookEditor = undefined;
+    vscode.window.visibleNotebookEditors.length = 0;
+    vscode.__test.inputs.length = 0;
+    providerModule.invalidateSecretCache();
+  }
+});
+
+test('a missing CLI offers a way to install it, not just a log', async () => {
+  // provider.js threw action:'install' in two places and nothing ever handled
+  // it, so the only button a stuck user got was "Show Log".
+  const extension = require(path.join('..', 'extension.js'));
+  const notebook = newNotebook(['x = 1']);
+  const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+  vscode.window.visibleNotebookEditors.push(editor);
+  vscode.window.activeNotebookEditor = editor;
+
+  vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+  vscode.__test.config.set('aiNotebookLive.claudePath', path.join(BRIDGE_HOME, 'no-such-claude'));
+  vscode.__test.inputs.push('do something');
+  vscode.__test.shown.length = 0;
+  vscode.__test.commands.clear();
+
+  // The search list includes several $HOME locations, so hiding a real install
+  // means moving HOME as well as PATH - otherwise this passes or fails
+  // depending on whether the person running it has Claude Code installed.
+  const saved = { PATH: process.env.PATH, HOME: process.env.HOME, EXEC: process.env.CLAUDE_CODE_EXECPATH };
+  process.env.PATH = BRIDGE_HOME;
+  process.env.HOME = BRIDGE_HOME;
+  delete process.env.CLAUDE_CODE_EXECPATH;
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  providerModule.invalidateCliCache();
+  providerModule.invalidateSecretCache();
+  extension.activate(context);
+  try {
+    await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+    assert.strictEqual(notebook.cellAt(0).document.getText(), 'x = 1', 'cell untouched');
+    const errors = vscode.__test.shown.filter((e) => e.kind === 'error');
+    assert.strictEqual(errors.length, 1);
+    assert.ok(errors[0].items.includes('Install Claude Code'), 'offers the install');
+    assert.ok(errors[0].items.includes('Set the claude path'), 'offers the escape hatch');
+  } finally {
+    process.env.PATH = saved.PATH;
+    process.env.HOME = saved.HOME;
+    if (saved.EXEC !== undefined) process.env.CLAUDE_CODE_EXECPATH = saved.EXEC;
+    await extension.deactivate();
+    vscode.__test.config.clear();
+    vscode.window.activeNotebookEditor = undefined;
+    vscode.window.visibleNotebookEditors.length = 0;
+    vscode.__test.inputs.length = 0;
+    providerModule.invalidateCliCache();
+    providerModule.invalidateSecretCache();
+  }
 });
 
 test('cancel and bridge commands are safe to call with nothing running', async () => {

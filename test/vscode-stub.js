@@ -125,15 +125,41 @@ const registry = {
   notebooks: [],
   executed: [],
   commands: new Map(),
+  edits: 0,
   failApplyEdit: false,
   onBeforeApply: null,
+  // Settings the test wants to differ from their declared defaults. Without a
+  // real backing store no test could exercise a non-default configuration.
+  config: new Map(),
+  // Queued answers for the modal/input surfaces, and a log of what was shown.
+  inputs: [],
+  picks: [],
+  shown: [],
 };
 
 const workspace = {
   notebookDocuments: registry.notebooks,
-  getConfiguration: () => ({ get: (_key, fallback) => fallback }),
+  getConfiguration: (section) => ({
+    get: (key, fallback) => {
+      const full = section ? `${section}.${key}` : key;
+      return registry.config.has(full) ? registry.config.get(full) : fallback;
+    },
+    inspect: (key) => {
+      const full = section ? `${section}.${key}` : key;
+      return {
+        key: full,
+        globalValue: registry.config.has(full) ? registry.config.get(full) : undefined,
+        workspaceValue: undefined,
+      };
+    },
+    update: async (key, value) => {
+      registry.config.set(section ? `${section}.${key}` : key, value);
+    },
+  }),
+  onDidChangeConfiguration: () => ({ dispose() {} }),
   getWorkspaceFolder: () => undefined,
   async applyEdit(edit) {
+    registry.edits += 1;
     // Opt-in hooks for tests: failure injection and a deterministic yield so
     // two concurrent writers can be interleaved on purpose. Both off by default.
     if (registry.onBeforeApply) await registry.onBeforeApply(edit);
@@ -170,10 +196,22 @@ const window = {
   createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
   createStatusBarItem: () => ({ text: '', tooltip: '', command: '', show() {}, hide() {}, dispose() {} }),
   onDidChangeActiveNotebookEditor: () => ({ dispose() {} }),
-  showInputBox: async () => undefined,
-  showInformationMessage: async () => undefined,
-  showWarningMessage: async () => undefined,
-  showErrorMessage: async () => undefined,
+  showInputBox: async (options) => {
+    registry.shown.push({ kind: 'input', options });
+    return registry.inputs.length ? registry.inputs.shift() : undefined;
+  },
+  showInformationMessage: async (message, ...items) => {
+    registry.shown.push({ kind: 'info', message, items });
+    return registry.picks.length ? registry.picks.shift() : undefined;
+  },
+  showWarningMessage: async (message, ...items) => {
+    registry.shown.push({ kind: 'warning', message, items });
+    return registry.picks.length ? registry.picks.shift() : undefined;
+  },
+  showErrorMessage: async (message, ...items) => {
+    registry.shown.push({ kind: 'error', message, items });
+    return registry.picks.length ? registry.picks.shift() : undefined;
+  },
   setStatusBarMessage: () => undefined,
 };
 

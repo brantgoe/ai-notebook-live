@@ -5,7 +5,14 @@ const { settings } = require('./src/config');
 const { log, show: showLog, dispose: disposeLog } = require('./src/log');
 const { CellWriter, readOutputs, runCell } = require('./src/notebook');
 const prompts = require('./src/prompt');
-const { stream, ProviderError, SECRET_KEY } = require('./src/provider');
+const {
+  stream,
+  resolveProvider,
+  ProviderError,
+  SECRET_KEY,
+  invalidateSecretCache,
+  invalidateCliCache,
+} = require('./src/provider');
 const { Bridge } = require('./src/bridge');
 
 const state = {
@@ -30,6 +37,26 @@ function activate(context) {
     defaultRun: () => settings().autoRun,
   });
 
+  // The provider probe is cached, so anything that could change its answer has
+  // to say so: a stored key changing, or the CLI path setting being edited.
+  if (context.secrets.onDidChange) {
+    context.subscriptions.push(
+      context.secrets.onDidChange((e) => {
+        if (!e || e.key === SECRET_KEY) invalidateSecretCache();
+      })
+    );
+  }
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (
+        e.affectsConfiguration('aiNotebookLive.claudePath') ||
+        e.affectsConfiguration('aiNotebookLive.provider')
+      ) {
+        invalidateCliCache();
+      }
+    })
+  );
+
   rememberNotebook(vscode.window.activeNotebookEditor);
   context.subscriptions.push(
     vscode.window.onDidChangeActiveNotebookEditor((editor) => {
@@ -41,10 +68,10 @@ function activate(context) {
   const register = (name, handler) =>
     context.subscriptions.push(vscode.commands.registerCommand(name, handler));
 
-  register('aiNotebookLive.generate', (arg) => guard('generate', (token) => generate(arg, token)));
-  register('aiNotebookLive.reviseCell', (arg) => guard('revise', (token) => revise(arg, token)));
-  register('aiNotebookLive.explainCell', (arg) => guard('explain', (token) => explain(arg, token)));
-  register('aiNotebookLive.fixError', (arg) => guard('fix', (token) => fixError(arg, token)));
+  register('aiNotebookLive.generate', (arg) => guard('generate', (ctx) => generate(arg, ctx)));
+  register('aiNotebookLive.reviseCell', (arg) => guard('revise', (ctx) => revise(arg, ctx)));
+  register('aiNotebookLive.explainCell', (arg) => guard('explain', (ctx) => explain(arg, ctx)));
+  register('aiNotebookLive.fixError', (arg) => guard('fix', (ctx) => fixError(arg, ctx)));
   register('aiNotebookLive.cancel', () => {
     if (state.active) {
       state.active.cancel();
@@ -54,7 +81,13 @@ function activate(context) {
   register('aiNotebookLive.setApiKey', setApiKey);
   register('aiNotebookLive.clearApiKey', async () => {
     await context.secrets.delete(SECRET_KEY);
-    vscode.window.showInformationMessage('AI Notebook Live: stored Anthropic API key removed.');
+    invalidateSecretCache();
+    const still = process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
+    vscode.window.showInformationMessage(
+      still
+        ? 'AI Notebook Live: stored key removed - but ANTHROPIC_API_KEY is still set in your environment and will be used.'
+        : 'AI Notebook Live: stored Anthropic API key removed.'
+    );
   });
   register('aiNotebookLive.startBridge', () => startBridge(true));
   register('aiNotebookLive.stopBridge', async () => {
@@ -70,6 +103,9 @@ function activate(context) {
     );
   });
   register('aiNotebookLive.showLog', showLog);
+
+  // Warm the probe so the first Ctrl+Alt+G costs no I/O.
+  resolveProvider(settings(), context.secrets).catch(() => {});
 
   if (settings().bridgeAutoStart) startBridge(false);
   log('activated');
@@ -111,12 +147,19 @@ async function guard(label, body) {
     if (pick === 'Cancel it') state.active.cancel();
     return;
   }
+  const opts = settings();
+  // Start proving the provider works now, but do not wait on it yet: the probe
+  // overlaps with the user typing their instruction, so it costs nothing. What
+  // matters is only that it resolves before anything edits the notebook.
+  const provider = resolveProvider(opts, state.context.secrets);
+  provider.catch(() => {});
+
   const cts = new vscode.CancellationTokenSource();
   state.active = cts;
   busy(label === 'explain' ? 'explaining' : 'writing');
   vscode.commands.executeCommand('setContext', 'aiNotebookLive.generating', true);
   try {
-    await body(cts.token);
+    await body({ token: cts.token, opts, provider });
   } catch (err) {
     await reportError(err);
   } finally {
@@ -130,6 +173,27 @@ async function guard(label, body) {
 async function reportError(err) {
   const message = (err && err.message) || String(err);
   log('error:', message);
+  if (err instanceof ProviderError && err.action === 'install') {
+    const pick = await vscode.window.showErrorMessage(
+      message,
+      'Install Claude Code',
+      'Set the claude path',
+      'Use an API key',
+      'Show Log'
+    );
+    if (pick === 'Install Claude Code') {
+      vscode.env.openExternal(vscode.Uri.parse('https://claude.com/claude-code'));
+    }
+    if (pick === 'Set the claude path') {
+      await vscode.commands.executeCommand(
+        'workbench.action.openSettings',
+        'aiNotebookLive.claudePath'
+      );
+    }
+    if (pick === 'Use an API key') await setApiKey();
+    if (pick === 'Show Log') showLog();
+    return;
+  }
   if (err instanceof ProviderError && err.action === 'setKey') {
     const pick = await vscode.window.showErrorMessage(message, 'Set API Key', 'Show Log');
     if (pick === 'Set API Key') await setApiKey();
@@ -150,6 +214,7 @@ async function setApiKey() {
   });
   if (!key) return;
   await state.context.secrets.store(SECRET_KEY, key.trim());
+  invalidateSecretCache();
   vscode.window.showInformationMessage('AI Notebook Live: API key saved.');
 }
 
@@ -231,7 +296,7 @@ async function ask(title, placeHolder) {
 
 /* -------------------------------- commands ------------------------------- */
 
-async function generate(arg, token) {
+async function generate(arg, { token, opts, provider }) {
   const editor = requireEditor();
   const notebook = editor.notebook;
   const instruction = await ask(
@@ -240,14 +305,14 @@ async function generate(arg, token) {
   );
   if (!instruction) return;
 
-  const opts = settings();
+  const target = await provider;
   const index = notebook.cellCount ? editor.selection.end : 0;
   const { system, user } = prompts.generatePrompt({ notebook, index, instruction, opts });
   const writer = await CellWriter.insert(notebook, index, { kind: 'code' });
-  await pump({ writer, system, user, opts, token, run: opts.autoRun });
+  await pump({ writer, system, user, opts, token, target, run: opts.autoRun });
 }
 
-async function revise(arg, token) {
+async function revise(arg, { token, opts, provider }) {
   const { notebook, cell } = resolveCell(arg);
   const instruction = await ask(
     'Revise this cell',
@@ -255,13 +320,13 @@ async function revise(arg, token) {
   );
   if (!instruction) return;
 
-  const opts = settings();
+  const target = await provider;
   const { system, user } = prompts.revisePrompt({ notebook, cell, instruction, opts });
   const writer = await CellWriter.replace(notebook, cell);
-  await pump({ writer, system, user, opts, token, run: opts.autoRun });
+  await pump({ writer, system, user, opts, token, target, run: opts.autoRun });
 }
 
-async function fixError(arg, token) {
+async function fixError(arg, { token, opts, provider }) {
   const { notebook, cell } = resolveCell(arg);
   if (cell.kind !== vscode.NotebookCellKind.Code) {
     throw new Error('that is a markdown cell - there is nothing to fix.');
@@ -275,21 +340,21 @@ async function fixError(arg, token) {
     if (pick !== 'Fix anyway') return;
   }
 
-  const opts = settings();
+  const target = await provider;
   const { system, user } = prompts.fixPrompt({ notebook, cell, opts });
   const writer = await CellWriter.replace(notebook, cell);
-  await pump({ writer, system, user, opts, token, run: opts.autoRun });
+  await pump({ writer, system, user, opts, token, target, run: opts.autoRun });
 }
 
-async function explain(arg, token) {
+async function explain(arg, { token, opts, provider }) {
   const { notebook, cell } = resolveCell(arg);
-  const opts = settings();
+  const target = await provider;
   const { system, user } = prompts.explainPrompt({ notebook, cell, opts });
   const writer = await CellWriter.insert(notebook, cell.index, {
     kind: 'markdown',
     fenced: false,
   });
-  await pump({ writer, system, user, opts, token, run: false });
+  await pump({ writer, system, user, opts, token, target, run: false });
 }
 
 /** The directory the `claude` CLI should run in: the notebook's own project. */
@@ -300,16 +365,16 @@ function workingDirFor(notebook) {
 }
 
 /** Runs one streaming request and lands every token in the cell as it arrives. */
-async function pump({ writer, system, user, opts, token, run }) {
+async function pump({ writer, system, user, opts, token, run, target }) {
   const started = Date.now();
   opts = { ...opts, cwd: workingDirFor(writer.notebook) };
   let result;
   try {
     result = await stream({
+      target,
       system,
       user,
       opts,
-      secrets: state.context.secrets,
       token,
       onText: (chunk) => writer.write(chunk),
     });
