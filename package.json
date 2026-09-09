@@ -1,0 +1,235 @@
+{
+  "name": "ai-notebook-live",
+  "displayName": "AI Notebook Live",
+  "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let external AI agents push cells in live over a localhost bridge.",
+  "version": "0.1.1",
+  "publisher": "brantgoe",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Notebooks",
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "jupyter",
+    "notebook",
+    "claude",
+    "anthropic",
+    "ai",
+    "codegen"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onNotebook:jupyter-notebook",
+    "onNotebook:interactive"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiNotebookLive.generate",
+        "title": "Generate Cell with AI...",
+        "category": "AI Notebook",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "aiNotebookLive.reviseCell",
+        "title": "Revise This Cell with AI...",
+        "category": "AI Notebook",
+        "icon": "$(wand)"
+      },
+      {
+        "command": "aiNotebookLive.explainCell",
+        "title": "Explain This Cell (markdown above)",
+        "category": "AI Notebook",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "aiNotebookLive.fixError",
+        "title": "Fix the Error in This Cell",
+        "category": "AI Notebook",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "aiNotebookLive.cancel",
+        "title": "Cancel AI Generation",
+        "category": "AI Notebook",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "aiNotebookLive.setApiKey",
+        "title": "Set Anthropic API Key",
+        "category": "AI Notebook"
+      },
+      {
+        "command": "aiNotebookLive.clearApiKey",
+        "title": "Clear Stored Anthropic API Key",
+        "category": "AI Notebook"
+      },
+      {
+        "command": "aiNotebookLive.startBridge",
+        "title": "Start Local Agent Bridge",
+        "category": "AI Notebook"
+      },
+      {
+        "command": "aiNotebookLive.stopBridge",
+        "title": "Stop Local Agent Bridge",
+        "category": "AI Notebook"
+      },
+      {
+        "command": "aiNotebookLive.copyBridgeInfo",
+        "title": "Copy Agent Bridge Example Command",
+        "category": "AI Notebook"
+      },
+      {
+        "command": "aiNotebookLive.showLog",
+        "title": "Show Log",
+        "category": "AI Notebook"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "aiNotebookLive.generate",
+        "key": "ctrl+alt+g",
+        "mac": "cmd+alt+g",
+        "when": "notebookEditorFocused"
+      },
+      {
+        "command": "aiNotebookLive.reviseCell",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r",
+        "when": "notebookEditorFocused"
+      },
+      {
+        "command": "aiNotebookLive.fixError",
+        "key": "ctrl+alt+f",
+        "mac": "cmd+alt+f",
+        "when": "notebookEditorFocused"
+      }
+    ],
+    "menus": {
+      "notebook/toolbar": [
+        {
+          "command": "aiNotebookLive.generate",
+          "group": "navigation/execute@10",
+          "when": "notebookType == 'jupyter-notebook' || notebookType == 'interactive'"
+        }
+      ],
+      "notebook/cell/title": [
+        {
+          "command": "aiNotebookLive.reviseCell",
+          "group": "inline@10",
+          "when": "notebookType == 'jupyter-notebook'"
+        },
+        {
+          "command": "aiNotebookLive.fixError",
+          "group": "inline@11",
+          "when": "notebookType == 'jupyter-notebook' && notebookCellHasOutputs"
+        },
+        {
+          "command": "aiNotebookLive.explainCell",
+          "group": "aiNotebook@1",
+          "when": "notebookType == 'jupyter-notebook'"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "aiNotebookLive.cancel",
+          "when": "aiNotebookLive.generating"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AI Notebook Live",
+      "properties": {
+        "aiNotebookLive.provider": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "api",
+            "claude-cli"
+          ],
+          "enumDescriptions": [
+            "Use the Anthropic API if a key is stored/exported, otherwise fall back to the local `claude` CLI.",
+            "Always use the Anthropic API (requires an API key).",
+            "Always use the local `claude` CLI (uses your existing Claude Code login, no API key needed)."
+          ],
+          "default": "auto",
+          "description": "Where generated code comes from."
+        },
+        "aiNotebookLive.model": {
+          "type": "string",
+          "default": "claude-opus-5",
+          "description": "Model id for generation (e.g. claude-opus-5, claude-sonnet-5, claude-haiku-4-5)."
+        },
+        "aiNotebookLive.effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium",
+          "description": "Reasoning effort for the Anthropic API provider. Lower is faster and cheaper; raise it for harder cells."
+        },
+        "aiNotebookLive.maxTokens": {
+          "type": "number",
+          "default": 8000,
+          "description": "Maximum tokens of generated output per cell."
+        },
+        "aiNotebookLive.contextCells": {
+          "type": "number",
+          "default": 12,
+          "description": "How many preceding notebook cells to send as context. Use -1 for the whole notebook."
+        },
+        "aiNotebookLive.includeOutputs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include recent cell outputs and errors in the context sent to the model."
+        },
+        "aiNotebookLive.autoRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "Execute a generated code cell automatically once streaming finishes."
+        },
+        "aiNotebookLive.systemPromptExtra": {
+          "type": "string",
+          "default": "",
+          "description": "Extra house style appended to the system prompt, e.g. \"Beginner class: keep code simple and comment every line.\""
+        },
+        "aiNotebookLive.refusalFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Anthropic server-side refusal fallbacks so a policy decline is retried on a fallback model inside the same request."
+        },
+        "aiNotebookLive.bridge.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start the localhost agent bridge automatically when a notebook is opened."
+        },
+        "aiNotebookLive.bridge.port": {
+          "type": "number",
+          "default": 37417,
+          "description": "Port for the localhost agent bridge. Use 0 to pick a free port."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0"
+  },
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "bin": {
+    "nbpush": "./bin/nbpush.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brantgoe/ai-notebook-live"
+  }
+}
