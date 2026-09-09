@@ -121,13 +121,23 @@ class CancellationTokenSource {
   dispose() {}
 }
 
-const registry = { notebooks: [], executed: [], commands: new Map() };
+const registry = {
+  notebooks: [],
+  executed: [],
+  commands: new Map(),
+  failApplyEdit: false,
+  onBeforeApply: null,
+};
 
 const workspace = {
   notebookDocuments: registry.notebooks,
   getConfiguration: () => ({ get: (_key, fallback) => fallback }),
   getWorkspaceFolder: () => undefined,
   async applyEdit(edit) {
+    // Opt-in hooks for tests: failure injection and a deterministic yield so
+    // two concurrent writers can be interleaved on purpose. Both off by default.
+    if (registry.onBeforeApply) await registry.onBeforeApply(edit);
+    if (registry.failApplyEdit) return false;
     for (const { uri, edits } of edit.notebookEdits) {
       const notebook = registry.notebooks.find((n) => n.uri.toString() === uri.toString());
       if (!notebook) return false;

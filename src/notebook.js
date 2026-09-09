@@ -6,6 +6,9 @@ const { log } = require('./log');
 // raw stream and reconcile the cell document on a timer instead.
 const FLUSH_MS = 60;
 
+// Serialises cell creation so two concurrent inserts cannot claim one cell.
+let insertLock = Promise.resolve();
+
 /**
  * Removes markdown code fences from a partially streamed response.
  * Models sometimes wrap cell code in ```python ... ``` despite instructions, and
@@ -45,6 +48,18 @@ function notebookLanguage(notebook) {
   return 'python';
 }
 
+/**
+ * Every notebook mutation goes through here. applyEdit returns false when the
+ * edit could not be applied - a read-only or closed notebook - and three of the
+ * four original call sites discarded that boolean, so a failed edit reported
+ * success and autoRun then executed stale content.
+ */
+async function apply(edit, what) {
+  if (!(await vscode.workspace.applyEdit(edit))) {
+    throw new Error(`Could not ${what}. The notebook may be read-only or closed.`);
+  }
+}
+
 function editorFor(notebook) {
   return vscode.window.visibleNotebookEditors.find((e) => e.notebook === notebook);
 }
@@ -56,14 +71,24 @@ function editorFor(notebook) {
  * re-resolved from its document URI before every flush.
  */
 class CellWriter {
-  constructor(notebook, cell, { fenced = true } = {}) {
+  constructor(notebook, cell, { fenced = true, origin = 'insert', original = '' } = {}) {
     this.notebook = notebook;
     this.uri = cell.document.uri.toString();
     this.fenced = fenced;
+    // Where this cell came from decides what abandoning it means: a cell we
+    // created is deleted, a cell we borrowed is handed back untouched.
+    this.origin = origin;
+    this.original = original;
     this.raw = '';
     this.timer = undefined;
     this.flushing = Promise.resolve();
     this.closed = false;
+    this.failed = undefined;
+  }
+
+  /** True once the model has produced text worth keeping. */
+  produced() {
+    return this.text().trim().length > 0;
   }
 
   static async insert(notebook, index, { kind = 'code', language, fenced = true } = {}) {
@@ -71,23 +96,51 @@ class CellWriter {
       language || (kind === 'markdown' ? 'markdown' : notebookLanguage(notebook));
     const cellKind =
       kind === 'markdown' ? vscode.NotebookCellKind.Markup : vscode.NotebookCellKind.Code;
-    const at = Math.max(0, Math.min(index, notebook.cellCount));
-    const data = new vscode.NotebookCellData(cellKind, '', lang);
-    const edit = new vscode.WorkspaceEdit();
-    edit.set(notebook.uri, [vscode.NotebookEdit.insertCells(at, [data])]);
-    if (!(await vscode.workspace.applyEdit(edit))) {
-      throw new Error('Could not insert a cell into the notebook.');
-    }
-    const cell = notebook.cellAt(at);
-    const writer = new CellWriter(notebook, cell, { fenced });
+
+    // Serialised, because the index is computed before an await and the cell is
+    // claimed after it: two concurrent inserts used to bind to the same cell,
+    // and one agent's content would silently overwrite the other's.
+    const run = insertLock.then(async () => {
+      const at = Math.max(0, Math.min(index, notebook.cellCount));
+      const before = new Set(notebook.getCells().map((c) => c.document.uri.toString()));
+      const data = new vscode.NotebookCellData(cellKind, '', lang);
+      const edit = new vscode.WorkspaceEdit();
+      edit.set(notebook.uri, [vscode.NotebookEdit.insertCells(at, [data])]);
+      await apply(edit, 'insert a cell into the notebook');
+      // Claim the cell by identity rather than by index, so a foreign edit that
+      // lands during the await cannot hand us somebody else's cell.
+      const created = notebook
+        .getCells()
+        .find((c) => !before.has(c.document.uri.toString()));
+      if (!created) throw new Error('The inserted cell could not be found.');
+      return created;
+    });
+    insertLock = run.then(
+      () => undefined,
+      () => undefined
+    );
+
+    const cell = await run;
+    const writer = new CellWriter(notebook, cell, { fenced, origin: 'insert' });
     writer.reveal();
     return writer;
   }
 
-  /** Streams into a cell that already exists, replacing whatever it holds. */
-  static async replace(notebook, cell, { fenced = true } = {}) {
-    const writer = new CellWriter(notebook, cell, { fenced });
-    await writer.setText('');
+  /**
+   * Streams into a cell that already exists.
+   *
+   * The cell is deliberately NOT cleared up front: setText diffs from whatever
+   * the document currently holds, so the user's code stays intact until the
+   * model's first token lands. Clearing early meant that the likeliest failure
+   * of all - no API key on a first run - destroyed their work.
+   */
+  static async replace(notebook, cell, { fenced } = {}) {
+    const writer = new CellWriter(notebook, cell, {
+      // Revising a markdown cell must not strip its fenced code blocks.
+      fenced: fenced !== undefined ? fenced : cell.kind === vscode.NotebookCellKind.Code,
+      origin: 'replace',
+      original: cell.document.getText(),
+    });
     writer.reveal();
     return writer;
   }
@@ -121,10 +174,18 @@ class CellWriter {
   }
 
   flush() {
+    // A closed writer must never touch the document again. Without this guard a
+    // late flush lands AFTER abandon() has restored the user's original text and
+    // overwrites it with the failed partial - the old test only passed because
+    // setText happened to no-op on a cell that had been deleted.
+    if (this.closed) return this.flushing;
     // Serialise flushes: overlapping applyEdit calls race on the same document.
     this.flushing = this.flushing
       .then(() => this.setText(this.text()))
-      .catch((err) => log('flush failed:', err && err.message ? err.message : String(err)));
+      .catch((err) => {
+        if (!this.failed) this.failed = err;
+        log('flush failed:', err && err.message ? err.message : String(err));
+      });
     return this.flushing;
   }
 
@@ -133,7 +194,8 @@ class CellWriter {
     return body.replace(/^\n+/, '');
   }
 
-  async setText(target) {
+  async setText(target, { force = false } = {}) {
+    if (this.closed && !force) return;
     const cell = this.cell();
     if (!cell) return;
     const doc = cell.document;
@@ -150,47 +212,73 @@ class CellWriter {
       new vscode.Range(doc.positionAt(keep), doc.positionAt(current.length)),
       target.slice(keep)
     );
-    await vscode.workspace.applyEdit(edit);
-  }
-
-  /** Final flush. Returns the text that ended up in the cell. */
-  async end({ run = false, trim = true } = {}) {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = undefined;
-    }
-    await this.flush();
-    const final = trim ? this.text().replace(/\s+$/, '') : this.text();
-    await this.flushing.then(() => this.setText(final));
-    this.closed = true;
-    const cell = this.cell();
-    if (run && cell && cell.kind === vscode.NotebookCellKind.Code && final.trim()) {
-      await runCell(this.notebook, cell.index);
-    }
-    return final;
+    await apply(edit, 'write into the cell');
   }
 
   /**
-   * Abandons the cell this writer created and removes it from the notebook.
-   * A request that fails partway - an over-sized body, a cancelled generation -
-   * must not leave a half-written cell behind for the user to clean up.
+   * Final reconcile. Returns the text that is actually in the document now -
+   * not the text we meant to write, which used to be reported as success even
+   * when every edit had failed.
+   *
+   * Execution is deliberately not decided here; see src/policy.js.
    */
-  async drop() {
+  async end({ trim = true } = {}) {
+    // Close BEFORE awaiting: a write landing during these awaits used to arm a
+    // timer that nothing afterwards would ever clear.
+    this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    // Stop accepting writes before awaiting, so nothing re-schedules a flush.
-    this.closed = true;
-    // Let an in-flight flush settle first, or it races the delete.
-    await this.flushing.catch(() => {});
+    const final = trim ? this.text().replace(/\s+$/, '') : this.text();
+    // Assigned back into the chain so the final write is serialised with the
+    // flushes, instead of racing them.
+    this.flushing = this.flushing.then(() => this.setText(final, { force: true }));
+    await this.flushing;
+    if (this.failed) throw this.failed;
     const cell = this.cell();
-    if (!cell) return false;
-    const edit = new vscode.WorkspaceEdit();
-    edit.set(this.notebook.uri, [
-      vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(cell.index, cell.index + 1)),
-    ]);
-    return vscode.workspace.applyEdit(edit);
+    if (!cell) throw new Error('The cell being written was removed from the notebook.');
+    return cell.document.getText();
+  }
+
+  /**
+   * Undo everything this writer did.
+   *
+   * An inserted cell is removed; a borrowed cell is handed back with exactly
+   * the text it had before streaming began. Restoring is itself an undoable
+   * edit, so a user who would rather keep the partial gets it with one Ctrl+Z -
+   * whereas reconstructing lost work by hand has no such shortcut.
+   *
+   * Never called for a cancellation: someone who cancels keeps what arrived.
+   */
+  async abandon() {
+    this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    await this.flushing.catch(() => {});
+    const partial = this.text();
+    const cell = this.cell();
+    if (!cell) return { restored: false, partial };
+
+    if (this.origin === 'insert') {
+      const edit = new vscode.WorkspaceEdit();
+      edit.set(this.notebook.uri, [
+        vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(cell.index, cell.index + 1)),
+      ]);
+      await apply(edit, 'remove the cell');
+      return { restored: true, partial };
+    }
+
+    await this.setText(this.original, { force: true });
+    return { restored: true, partial };
+  }
+
+  /** Back-compat alias; the bridge still calls this. Removed in phase 4. */
+  async drop() {
+    const { restored } = await this.abandon();
+    return restored;
   }
 }
 

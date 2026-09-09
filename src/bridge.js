@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { CellWriter, editorFor } = require('./notebook');
+const { CellWriter, editorFor, runCell } = require('./notebook');
 const { log } = require('./log');
 
 const MAX_BODY = 1024 * 1024;
@@ -183,8 +183,12 @@ class Bridge {
   async closeWriter(writer, options) {
     const raw = options.run !== undefined ? options.run : options.search.get('run');
     const run = raw === undefined || raw === null ? this.defaultRun() : truthy(raw);
-    const text = await writer.end({ run });
-    return { ok: true, index: writer.index, characters: text.length, ran: run };
+    const text = await writer.end();
+    // Execution is a separate decision from writing; phase 4 routes this
+    // through the shared policy so a caller cannot escalate past the user.
+    const ran = Boolean(run && text.trim());
+    if (ran) await runCell(writer.notebook, writer.index);
+    return { ok: true, index: writer.index, characters: text.length, ran };
   }
 }
 

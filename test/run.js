@@ -23,7 +23,7 @@ Module._resolveFilename = function (request, ...rest) {
 };
 
 const vscode = require('./vscode-stub.js');
-const { CellWriter, unfence, readOutputs } = require(path.join('..', 'src', 'notebook.js'));
+const { CellWriter, unfence, readOutputs, runCell } = require(path.join('..', 'src', 'notebook.js'));
 const { Bridge } = require(path.join('..', 'src', 'bridge.js'));
 
 let failures = 0;
@@ -90,7 +90,7 @@ test('insert streams chunks into a new cell and strips fences', async () => {
     writer.write(chunk);
     await writer.flush();
   }
-  const text = await writer.end({ run: false });
+  const text = await writer.end();
   assert.strictEqual(text, 'print(x)');
   assert.strictEqual(notebook.cellAt(1).document.getText(), 'print(x)');
 });
@@ -107,7 +107,7 @@ test('writer survives cells shifting underneath it', async () => {
     ]),
   ]);
   await vscode.workspace.applyEdit(edit);
-  const text = await writer.end({ run: false });
+  const text = await writer.end();
   assert.strictEqual(text, 'print(a + b)');
   assert.strictEqual(writer.index, 3);
   assert.strictEqual(notebook.cellAt(3).document.getText(), 'print(a + b)');
@@ -117,9 +117,15 @@ test('writer survives cells shifting underneath it', async () => {
 test('replace rewrites an existing cell in place', async () => {
   const notebook = newNotebook(['prnt("typo")']);
   const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
-  assert.strictEqual(notebook.cellAt(0).document.getText(), '');
+  assert.strictEqual(
+    notebook.cellAt(0).document.getText(),
+    'prnt("typo")',
+    'the original must survive until the model produces something'
+  );
   writer.write('print("typo")');
-  await writer.end({ run: true });
+  const replaced = await writer.end();
+  await runCell(notebook, writer.index);
+  assert.strictEqual(replaced, 'print("typo")');
   assert.strictEqual(notebook.cellCount, 1);
   assert.strictEqual(notebook.cellAt(0).document.getText(), 'print("typo")');
   assert.deepStrictEqual(vscode.__test.executed[0].payload.ranges, [{ start: 0, end: 1 }]);
@@ -129,7 +135,7 @@ test('markdown cells keep their fenced code blocks', async () => {
   const notebook = newNotebook(['x = 1']);
   const writer = await CellWriter.insert(notebook, 0, { kind: 'markdown', fenced: false });
   writer.write('## Setup\n\n```python\nx = 1\n```');
-  const text = await writer.end({ run: false });
+  const text = await writer.end();
   assert.ok(text.includes('```python'));
   assert.strictEqual(notebook.cellAt(0).kind, vscode.NotebookCellKind.Markup);
 });
@@ -137,9 +143,111 @@ test('markdown cells keep their fenced code blocks', async () => {
 test('empty generations leave an empty cell the caller can drop', async () => {
   const notebook = newNotebook([]);
   const writer = await CellWriter.insert(notebook, 0, { kind: 'code' });
-  const text = await writer.end({ run: true });
+  const text = await writer.end();
   assert.strictEqual(text, '');
   assert.strictEqual(vscode.__test.executed.length, 0, 'must not execute an empty cell');
+});
+
+test('a failed replace hands the cell back exactly as it was', async () => {
+  const notebook = newNotebook(['answer = 42  # hard-won']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('answer = ');
+  await writer.flush();
+  const { restored, partial } = await writer.abandon();
+  assert.ok(restored);
+  assert.strictEqual(partial, 'answer = ', 'the partial is offered back to the caller');
+  assert.strictEqual(
+    notebook.cellAt(0).document.getText(),
+    'answer = 42  # hard-won',
+    'the user gets their own code back, not a half-written statement'
+  );
+});
+
+test('a writer abandoned after a restore cannot clobber it later', async () => {
+  // The landmine: write() checked `closed` but flush() did not, so a flush that
+  // was still in flight landed after the restore and overwrote it again.
+  const notebook = newNotebook(['keep = "me"']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('destroyed = True');
+  await writer.abandon();
+  writer.write('and again');
+  await writer.flush();
+  await writer.flush();
+  assert.strictEqual(
+    notebook.cellAt(0).document.getText(),
+    'keep = "me"',
+    'nothing may write through a writer that has been abandoned'
+  );
+});
+
+test('an abandoned insert removes its own cell and leaves neighbours alone', async () => {
+  const notebook = newNotebook(['first', 'second']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  writer.write('half a thought');
+  await writer.flush();
+  await writer.abandon();
+  assert.strictEqual(notebook.cellCount, 2);
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'first');
+  assert.strictEqual(notebook.cellAt(1).document.getText(), 'second');
+});
+
+test('end() reports the document, and throws instead of faking success', async () => {
+  const notebook = newNotebook([]);
+  const writer = await CellWriter.insert(notebook, 0, { kind: 'code' });
+  writer.write('print("real")');
+  const text = await writer.end();
+  assert.strictEqual(text, 'print("real")');
+  assert.strictEqual(text, notebook.cellAt(0).document.getText(), 'the return value IS the document');
+
+  const second = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  second.write('print("this edit will fail")');
+  vscode.__test.failApplyEdit = true;
+  try {
+    await assert.rejects(() => second.end(), /Could not write into the cell/);
+  } finally {
+    vscode.__test.failApplyEdit = false;
+  }
+});
+
+test('two concurrent inserts never claim the same cell', async () => {
+  const notebook = newNotebook(['x = 1']);
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  // Hold the first insert inside applyEdit while the second one runs to
+  // completion, which is exactly the window the index-based claim lost.
+  let first = true;
+  vscode.__test.onBeforeApply = async () => {
+    if (!first) return;
+    first = false;
+    await gate;
+  };
+  try {
+    const a = CellWriter.insert(notebook, 1, { kind: 'code' });
+    const b = CellWriter.insert(notebook, 1, { kind: 'code' });
+    release();
+    const [wa, wb] = await Promise.all([a, b]);
+    assert.notStrictEqual(wa.uri, wb.uri, 'each writer must own a distinct cell');
+    wa.write('AAA');
+    wb.write('BBB');
+    await Promise.all([wa.end(), wb.end()]);
+    const texts = notebook.getCells().map((c) => c.document.getText());
+    assert.ok(texts.includes('AAA'), 'the first agent kept its content');
+    assert.ok(texts.includes('BBB'), 'the second agent kept its content');
+  } finally {
+    vscode.__test.onBeforeApply = null;
+  }
+});
+
+test('revising a markdown cell keeps its fenced code blocks', async () => {
+  const notebook = newNotebook([
+    { kind: vscode.NotebookCellKind.Markup, value: '# notes', languageId: 'markdown' },
+  ]);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('## notes\n\n```python\nx = 1\n```');
+  const text = await writer.end();
+  assert.ok(text.includes('```python'), 'markdown must not be unfenced');
 });
 
 /* ------------------------------ readOutputs ----------------------------- */

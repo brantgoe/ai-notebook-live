@@ -3,7 +3,7 @@ const path = require('path');
 const vscode = require('vscode');
 const { settings } = require('./src/config');
 const { log, show: showLog, dispose: disposeLog } = require('./src/log');
-const { CellWriter, readOutputs } = require('./src/notebook');
+const { CellWriter, readOutputs, runCell } = require('./src/notebook');
 const prompts = require('./src/prompt');
 const { stream, ProviderError, SECRET_KEY } = require('./src/provider');
 const { Bridge } = require('./src/bridge');
@@ -244,7 +244,7 @@ async function generate(arg, token) {
   const index = notebook.cellCount ? editor.selection.end : 0;
   const { system, user } = prompts.generatePrompt({ notebook, index, instruction, opts });
   const writer = await CellWriter.insert(notebook, index, { kind: 'code' });
-  await pump({ writer, system, user, opts, token, run: opts.autoRun, dropIfEmpty: true });
+  await pump({ writer, system, user, opts, token, run: opts.autoRun });
 }
 
 async function revise(arg, token) {
@@ -258,7 +258,7 @@ async function revise(arg, token) {
   const opts = settings();
   const { system, user } = prompts.revisePrompt({ notebook, cell, instruction, opts });
   const writer = await CellWriter.replace(notebook, cell);
-  await pump({ writer, system, user, opts, token, run: opts.autoRun, undoHint: true });
+  await pump({ writer, system, user, opts, token, run: opts.autoRun });
 }
 
 async function fixError(arg, token) {
@@ -278,7 +278,7 @@ async function fixError(arg, token) {
   const opts = settings();
   const { system, user } = prompts.fixPrompt({ notebook, cell, opts });
   const writer = await CellWriter.replace(notebook, cell);
-  await pump({ writer, system, user, opts, token, run: true, undoHint: true });
+  await pump({ writer, system, user, opts, token, run: opts.autoRun });
 }
 
 async function explain(arg, token) {
@@ -289,7 +289,7 @@ async function explain(arg, token) {
     kind: 'markdown',
     fenced: false,
   });
-  await pump({ writer, system, user, opts, token, run: false, dropIfEmpty: true });
+  await pump({ writer, system, user, opts, token, run: false });
 }
 
 /** The directory the `claude` CLI should run in: the notebook's own project. */
@@ -300,7 +300,7 @@ function workingDirFor(notebook) {
 }
 
 /** Runs one streaming request and lands every token in the cell as it arrives. */
-async function pump({ writer, system, user, opts, token, run, dropIfEmpty, undoHint }) {
+async function pump({ writer, system, user, opts, token, run }) {
   const started = Date.now();
   opts = { ...opts, cwd: workingDirFor(writer.notebook) };
   let result;
@@ -314,13 +314,37 @@ async function pump({ writer, system, user, opts, token, run, dropIfEmpty, undoH
       onText: (chunk) => writer.write(chunk),
     });
   } catch (err) {
-    await writer.end({ run: false });
-    if (dropIfEmpty) await dropEmpty(writer);
+    // The writer knows what undoing itself means: delete a cell we created,
+    // hand back a cell we borrowed. pump no longer has to be told.
+    const { partial } = await writer.abandon();
+    if (writer.origin === 'replace' && partial.trim()) {
+      const lines = partial.split('\n').length;
+      vscode.window
+        .showWarningMessage(
+          `AI Notebook Live: that failed partway, so your cell was put back. Ctrl+Z brings back the ${lines} line${lines === 1 ? '' : 's'} the AI had written.`,
+          'Keep what the AI wrote'
+        )
+        .then((pick) => {
+          if (pick) writer.setText(partial, { force: true });
+        });
+    }
     throw err;
   }
 
-  const text = await writer.end({ run: run && !result.cancelled && !result.refused });
-  if (!text.trim() && dropIfEmpty) await dropEmpty(writer);
+  // Nothing usable came back: undo rather than leave an empty cell behind.
+  // This is also what stops a failed revise from blanking the user's cell.
+  if (!writer.produced()) {
+    await writer.abandon();
+    if (result.cancelled) {
+      vscode.window.setStatusBarMessage('$(stop-circle) AI generation cancelled', 2500);
+      return;
+    }
+  }
+
+  const text = writer.produced() ? await writer.end() : '';
+  if (text.trim() && run && !result.cancelled && !result.refused) {
+    await runCell(writer.notebook, writer.index);
+  }
 
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   log(
@@ -346,21 +370,10 @@ async function pump({ writer, system, user, opts, token, run, dropIfEmpty, undoH
     return;
   }
   vscode.window.setStatusBarMessage(
-    `$(sparkle) AI wrote ${text.split('\n').length} lines in ${seconds}s${
-      undoHint ? ' - Ctrl+Z restores the original' : ''
-    }`,
+    `$(sparkle) AI wrote ${text.split('\n').length} lines in ${seconds}s`,
     6000
   );
 }
 
-async function dropEmpty(writer) {
-  const index = writer.index;
-  if (index < 0) return;
-  const edit = new vscode.WorkspaceEdit();
-  edit.set(writer.notebook.uri, [
-    vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(index, index + 1)),
-  ]);
-  await vscode.workspace.applyEdit(edit);
-}
 
 module.exports = { activate, deactivate };
