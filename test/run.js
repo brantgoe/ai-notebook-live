@@ -27,8 +27,14 @@ const { CellWriter, unfence, readOutputs, runCell } = require(path.join('..', 's
 const { Bridge } = require(path.join('..', 'src', 'bridge.js'));
 
 let failures = 0;
+let skipped = 0;
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
+/** Thrown by a test that cannot run here. Reported as a skip, never as a pass. */
+class Skip extends Error {}
+const skip = (why) => {
+  throw new Skip(why);
+};
 
 function newNotebook(cells = []) {
   const notebook = new vscode.NotebookDocument(
@@ -768,6 +774,16 @@ function fakeClaude(scenario) {
 
 /** Runs one request against a stand-in CLI and cleans up after itself. */
 async function withFakeClaude(scenario, fn) {
+  if (process.platform === 'win32') {
+    // Not a limitation of the test. streamCli spawns without shell:true, and a
+    // .cmd - which is what an npm-installed CLI is on Windows - cannot be
+    // spawned that way on Node >= 20.12 (the CVE-2024-27980 fix): it throws
+    // EINVAL. locateClaude also looks for a file named exactly "claude", with
+    // no .cmd/.exe/.ps1 variants, so it would not find one in the first place.
+    // The CLI provider does not currently work on Windows at all; see
+    // qa/BUGS.md S3-1. Faking it here would hide that, so this skips instead.
+    skip('the claude CLI provider does not support Windows yet (qa/BUGS.md S3-1)');
+  }
   const fake = fakeClaude(scenario);
   try {
     return await fn(fake.binary);
@@ -1991,10 +2007,18 @@ test('cancel and bridge commands are safe to call with nothing running', async (
       await fn();
       process.stdout.write(`  ok   ${name}\n`);
     } catch (err) {
+      if (err instanceof Skip) {
+        skipped += 1;
+        process.stdout.write(`  skip ${name}\n       ${err.message}\n`);
+        continue;
+      }
       failures += 1;
       process.stdout.write(`  FAIL ${name}\n       ${err.message}\n`);
     }
   }
-  process.stdout.write(`\n${tests.length - failures}/${tests.length} passed\n`);
+  process.stdout.write(
+    `\n${tests.length - failures - skipped}/${tests.length} passed` +
+      `${skipped ? `, ${skipped} skipped` : ''}\n`
+  );
   process.exit(failures ? 1 : 0);
 })();

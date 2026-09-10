@@ -197,6 +197,9 @@ except the provider you chose, for a request you triggered.
 - Writes into the notebook **currently open in VS Code**. It does not edit files
   on disk, and cannot help with a notebook that is closed.
 - Running cells needs the Jupyter extension and a live kernel.
+- **The Claude Code CLI provider does not work on Windows yet** — the CLI is
+  installed there as a `.cmd`, which this extension neither finds nor launches
+  correctly. Use an Anthropic API key on Windows for now.
 - `maxTokens`, `effort` and `refusalFallback` apply to the API provider only.
 - On models with extended thinking there can be a pause before any text appears;
   the status bar shows a spinner while it works.
