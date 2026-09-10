@@ -127,20 +127,83 @@ function oneOf(value, allowed, fallback) {
  * passes untouched. A RAW ESC byte in the source of a cell is almost always an
  * accident or an injection, and refusing it costs nobody anything.
  */
-function cellText(value, { field = 'code' } = {}) {
+/**
+ * Characters that are legal Unicode but that Python refuses outright, and that
+ * a person cannot see. Verified against real python3 compile(), not assumed:
+ * NBSP, soft hyphen, BOM, the zero-width family and every C1 control all fail
+ * with "invalid non-printable character". NBSP is the one that matters - it is
+ * the most common invisible character in model-written Python, and it produced
+ * a SyntaxError naming a code point rather than the cause.
+ *
+ * These are REPAIRED rather than refused: NBSP means a space, and the rest mean
+ * nothing at all. Refusing would throw away a whole cell over something
+ * invisible that we know how to fix.
+ */
+function repairInvisibles(value) {
+  let out = '';
+  let repaired = 0;
+  for (const ch of value) {
+    const c = ch.codePointAt(0);
+    if (c === 0x00a0 || c === 0x202f) {
+      out += ' ';
+      repaired += 1;
+    } else if (
+      (c >= 0x80 && c <= 0x9f) || // C1 controls, incl. U+009B CSI
+      c === 0x00ad || // soft hyphen
+      c === 0xfeff || // BOM anywhere but the very start
+      (c >= 0x200b && c <= 0x200f) || // zero-width and directional marks
+      c === 0x2060
+    ) {
+      repaired += 1;
+    } else {
+      out += ch;
+    }
+  }
+  return { text: out, repaired };
+}
+
+/**
+ * Text that can actually live in a notebook cell.
+ *
+ * Two modes, because the two callers cannot do the same thing about a problem.
+ * A BRIDGE caller can be told no and retry, so anything unfixable is refused
+ * with the character and the offset named. The MODEL cannot: throwing there
+ * discards an entire generation the user waited for, so its output is repaired
+ * instead and the repair is reported.
+ */
+function cellText(value, { field = 'code', mode = 'refuse' } = {}) {
   if (typeof value !== 'string') {
+    if (mode === 'sanitize') return { text: '', repaired: 0 };
     throw new InvalidInput(`${field} must be a string`);
   }
+  const sanitize = mode === 'sanitize';
+  let out = '';
+  let repaired = 0;
   for (let i = 0; i < value.length; i += 1) {
     const c = value.charCodeAt(i);
-    if (c === 0x09 || c === 0x0a || c === 0x0d) continue;
+    // \t \n \r keep a cell readable; \f is legal Python whitespace and used
+    // to be refused by the blanket C0 range - measured: compile("a=1\n\x0cb=2\n")
+    // succeeds, and GNU-style source really does contain it.
+    if (c === 0x09 || c === 0x0a || c === 0x0d || c === 0x0c) {
+      out += value[i];
+      continue;
+    }
     if (c < 0x20 || c === 0x7f) {
+      if (sanitize) {
+        repaired += 1;
+        continue;
+      }
       throw new InvalidInput(
         `${field} contains a control character (U+${c.toString(16).toUpperCase().padStart(4, '0')}) ` +
           `at position ${i}, which a notebook kernel cannot run`
       );
     }
     if (c === 0x2028 || c === 0x2029) {
+      if (sanitize) {
+        out += '\n';
+        repaired += 1;
+        continue;
+      }
       throw new InvalidInput(
         `${field} contains U+${c.toString(16).toUpperCase()} at position ${i}, ` +
           'which Python rejects as a non-printable character'
@@ -150,21 +213,37 @@ function cellText(value, { field = 'code' } = {}) {
     // appear alone. Either way round, the result cannot be encoded as UTF-8.
     if (c >= 0xd800 && c <= 0xdbff) {
       const next = value.charCodeAt(i + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) {
-        throw new InvalidInput(
-          `${field} contains an unpaired surrogate at position ${i}. The notebook ` +
-            'would become unreadable to nbformat, nbconvert and papermill'
-        );
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += value[i] + value[i + 1];
+        i += 1;
+        continue;
       }
-      i += 1;
-    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      if (sanitize) {
+        repaired += 1;
+        continue;
+      }
       throw new InvalidInput(
         `${field} contains an unpaired surrogate at position ${i}. The notebook ` +
           'would become unreadable to nbformat, nbconvert and papermill'
       );
     }
+    if (c >= 0xdc00 && c <= 0xdfff) {
+      if (sanitize) {
+        repaired += 1;
+        continue;
+      }
+      throw new InvalidInput(
+        `${field} contains an unpaired surrogate at position ${i}. The notebook ` +
+          'would become unreadable to nbformat, nbconvert and papermill'
+      );
+    }
+    out += value[i];
   }
-  return value;
+  // Repaired on BOTH paths: a cell full of NBSP is no more runnable because a
+  // human sent it, and the fix is not a guess.
+  const fixed = repairInvisibles(out);
+  if (sanitize) return { text: fixed.text, repaired: repaired + fixed.repaired };
+  return fixed.text;
 }
 
 module.exports = {

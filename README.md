@@ -249,7 +249,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 99 tests, no VS Code needed
+npm test          # 105 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

@@ -4,6 +4,7 @@ const vscode = require('vscode');
 const { settings } = require('./src/config');
 const { log, show: showLog, dispose: disposeLog } = require('./src/log');
 const { CellWriter, readOutputs, runCell, runApproved } = require('./src/notebook');
+const validate = require('./src/validate');
 const prompts = require('./src/prompt');
 const {
   stream,
@@ -751,6 +752,7 @@ async function pump({ writer, system, user, opts, token, target, intent, request
   const silence = Math.max(30, Number(opts.timeoutSeconds) || 300) * 1000;
   let idle;
   let gaveUp = false;
+  let repaired = 0;
   const restartIdleTimer = () => {
     if (idle) clearTimeout(idle);
     idle = setTimeout(() => {
@@ -783,7 +785,23 @@ async function pump({ writer, system, user, opts, token, target, intent, request
         token,
         onText: (chunk) => {
           restartIdleTimer();
-          writer.write(chunk);
+          // The one path that was never validated. cellText guarded all three
+          // BRIDGE entry points and nothing at all here - where the traffic
+          // actually is. Measured: a raw ESC, a NUL, a U+2028 and a lone
+          // surrogate all reached the cell straight from the model, and the
+          // surrogate is precisely the failure cellText exists to prevent - the
+          // .ipynb saves fine and then nbformat, nbconvert and papermill cannot
+          // read it back. A model need only echo one out of a cell output it
+          // was shown.
+          //
+          // Repaired rather than refused: throwing here would discard a whole
+          // generation the user waited for, over something invisible.
+          const clean = validate.cellText(chunk, { mode: 'sanitize' });
+          if (clean.repaired) {
+            repaired += clean.repaired;
+            log(`repaired ${clean.repaired} character(s) the kernel could not have run`);
+          }
+          writer.write(clean.text);
         },
       });
     } catch (err) {
@@ -870,6 +888,12 @@ async function pump({ writer, system, user, opts, token, target, intent, request
         `The cell hit the ${opts.maxTokens}-token limit and may be cut off. Raise aiNotebookLive.maxTokens.`
       );
       return;
+    }
+  if (repaired) {
+      vscode.window.showInformationMessage(
+        `AI Notebook Live: cleaned up ${repaired} invisible character${repaired === 1 ? '' : 's'} ` +
+          'the model emitted that Python cannot parse - a non-breaking space, usually.'
+      );
     }
     vscode.window.setStatusBarMessage(
       `$(sparkle) AI wrote ${text.split('\n').length} lines in ${seconds}s`,

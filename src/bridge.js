@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   CellWriter,
+  clipText,
   editorFor,
   runCell,
   runApproved,
@@ -447,7 +448,7 @@ class Bridge {
         index: cell.index,
         kind: cellKindName(cell),
         language: cell.document.languageId,
-        source: clipped ? `${text.slice(0, LIMIT)}\n...<truncated>` : text,
+        source: clipped ? clipText(text, LIMIT) : text,
       };
       // Per cell, not just once for the whole response. A caller deciding
       // whether it may safely rewrite cell 7 needs to know about CELL 7, and a

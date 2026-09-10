@@ -24,6 +24,7 @@ Module._resolveFilename = function (request, ...rest) {
 
 const vscode = require('./vscode-stub.js');
 const { CellWriter, unfence, readOutputs, runCell } = require(path.join('..', 'src', 'notebook.js'));
+const notebookModule = require(path.join('..', 'src', 'notebook.js'));
 const { Bridge } = require(path.join('..', 'src', 'bridge.js'));
 
 let failures = 0;
@@ -1177,6 +1178,9 @@ function fakeClaude(scenario) {
       '  if (s === "hang") return;',
       '  if (s === "in_band_failure") return out({ type: "result", subtype: "error_max_turns", result: "ran out of turns" }, () => process.exit(0));',
       '  if (s === "quiet_success") return process.exit(0);',
+      // Emits characters a kernel cannot run: NUL, a raw ESC, and a lone
+      // surrogate - the last being what makes an .ipynb unreadable to nbformat.
+      '  if (s === "poison") return delta("x = 1\\u0000\\u001b[31m\\u00a0y = 2\\ud800", () => out({ type: "result", subtype: "success" }, () => process.exit(0)));',
       // Two deltas far enough apart that the 60ms flush timer fires between
       // them, so the cell is already part-written when the stream ends. A single
       // fast delta produces exactly ONE edit - end()'s own - which is no use for
@@ -1510,6 +1514,139 @@ test('a claudePath pointing at a directory is not mistaken for the CLI', async (
   const found = providerCli.locateClaude(dir);
   assert.ok(!found.found || found.binary !== dir, 'a directory is not an executable');
   providerCli.invalidateCliCache();
+});
+
+test('the model cannot write a character the kernel could never run', async () => {
+  // cellText guarded all three BRIDGE entry points and nothing at all on the
+  // path the traffic actually takes. Measured: a raw ESC, a NUL, a U+2028 and a
+  // LONE SURROGATE all reached the cell straight from the model - the surrogate
+  // being precisely the failure cellText exists to prevent, since the .ipynb
+  // saves fine and then nbformat, nbconvert and papermill cannot read it back.
+  const poison = 'x = 1\x00\x1b[31m \ud800 y = 2';
+  const clean = validate.cellText(poison, { mode: 'sanitize' });
+  assert.ok(clean.repaired >= 3, 'the unrunnable characters are repaired, not passed through');
+  // Repaired, not refused: throwing would discard a whole generation the user
+  // waited for, over something invisible.
+  assert.doesNotThrow(() => validate.cellText(clean.text));
+  assert.ok(clean.text.includes('x = 1') && clean.text.includes('y = 2'), 'the code survives');
+});
+
+test('cellText matches what Python actually refuses', async () => {
+  // The rejection set was wrong in BOTH directions, measured against real
+  // python3 compile() across the BMP: it ACCEPTED the invisible characters
+  // Python rejects - NBSP above all, the most common one in model-written
+  // Python - and REFUSED U+000C, which is legal Python whitespace.
+  assert.doesNotThrow(
+    () => validate.cellText('a = 1\n\x0cb = 2\n'),
+    'a form feed is legal Python whitespace and appears in real source'
+  );
+  // NBSP means a space and the rest mean nothing, so they are repaired rather
+  // than refused - refusing throws away a whole cell over something invisible.
+  assert.strictEqual(validate.cellText('a = 1'), 'a = 1', 'NBSP becomes a space');
+  for (const [name, ch] of [
+    ['soft hyphen', '­'],
+    ['BOM', '﻿'],
+    ['zero-width space', '​'],
+    ['C1 CSI', ''],
+  ]) {
+    assert.strictEqual(validate.cellText(`a${ch} = 1`), 'a = 1', `${name} is removed`);
+  }
+  // What genuinely cannot be repaired is still refused, with the offset named.
+  assert.throws(() => validate.cellText('a b'), /control character/);
+  assert.throws(() => validate.cellText('a\ud800b'), /unpaired surrogate/);
+});
+
+test('clipping a cell never leaves half of a character behind', async () => {
+  // The three clip paths used slice(), which works on UTF-16 code units, so a
+  // cut mid-emoji left a lone surrogate. Measured: /cells handed back `source`
+  // that this project's OWN cellText then refused on the way back in, so a
+  // read-modify-write client broke on our own output.
+  const s = `${'a'.repeat(1999)}\u{1F600}${'b'.repeat(20)}`;
+  const cut = notebookModule.clipText(s, 2000);
+  const last = cut.charCodeAt(1999);
+  assert.ok(!(last >= 0xd800 && last <= 0xdbff), 'the cut backs off the pair');
+  assert.doesNotThrow(() => validate.cellText(cut), 'and the result round-trips');
+});
+
+test('an indented closing fence is still a closing fence', async () => {
+  // CommonMark allows up to three spaces, and models indent fences inside
+  // numbered lists. The OPENER is already de-indented by the leading-whitespace
+  // strip, which made this asymmetric: the marker was left in the cell, which
+  // is a guaranteed SyntaxError.
+  assert.strictEqual(unfence('  ```py\nprint(1)\n  ```', { final: true }), 'print(1)');
+  assert.strictEqual(unfence('```py\nprint(1)\n   ```', { final: true }), 'print(1)');
+  assert.strictEqual(unfence('```py\nprint(1)\n```', { final: true }), 'print(1)');
+  // Four spaces is an indented code block, not a fence, so it stays content.
+  assert.match(unfence('```py\nprint(1)\n    ```', { final: true }), /```/);
+});
+
+test('an insert claims the cell it asked for, not the user\'s new one', async () => {
+  // find() returned the first unrecognised cell in DOCUMENT ORDER, so a user
+  // pressing "+ Code" above during the applyEdit window made the writer claim
+  // THEIR brand-new cell and stream into it - the exact scenario the identity
+  // check exists to prevent, answered with the wrong cell.
+  const notebook = newNotebook(['a = 1', 'b = 2']);
+  vscode.__test.onBeforeApply = async () => {
+    // Cleared first, or this re-enters on its own edit.
+    vscode.__test.onBeforeApply = null;
+    // The user presses "+ Code" at the very top while our insert is in flight.
+    const mine = new vscode.WorkspaceEdit();
+    mine.set(notebook.uri, [
+      vscode.NotebookEdit.insertCells(0, [
+        new vscode.NotebookCellData(vscode.NotebookCellKind.Code, 'MINE', 'python'),
+      ]),
+    ]);
+    await vscode.workspace.applyEdit(mine);
+  };
+  try {
+    const writer = await CellWriter.insert(notebook, 2, { kind: 'code' });
+    writer.write('AI TEXT');
+    await writer.flush();
+    assert.strictEqual(
+      notebook.getCells().find((c) => c.document.getText() === 'MINE') !== undefined,
+      true,
+      "the user's own new cell must be left alone"
+    );
+    assert.notStrictEqual(writer.cell().document.getText(), 'MINE');
+  } finally {
+    vscode.__test.onBeforeApply = null;
+  }
+});
+
+test('poison from the model never reaches the cell', async () => {
+  // The wiring, not the validator. Testing validate.cellText directly leaves
+  // this green even when pump stops calling it - measured: removing the call
+  // failed nothing. That is the exact seam this whole audit is about.
+  await withFakeClaude('poison', async (binary) => {
+    const extension = require(path.join('..', 'extension.js'));
+    const notebook = newNotebook(['answer = 42']);
+    const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+    vscode.window.visibleNotebookEditors.push(editor);
+    vscode.window.activeNotebookEditor = editor;
+    vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+    vscode.__test.config.set('aiNotebookLive.claudePath', binary);
+    vscode.__test.config.set('aiNotebookLive.execution', 'never');
+    vscode.__test.inputs.push('simplify it');
+    const context = {
+      subscriptions: [],
+      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    };
+    extension.activate(context);
+    try {
+      await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+      const written = notebook.cellAt(0).document.getText();
+      assert.ok(written.includes('x = 1') && written.includes('y = 2'), 'the code survives');
+      // The whole point: whatever landed must be something the notebook format
+      // and the kernel can both actually handle.
+      assert.doesNotThrow(
+        () => validate.cellText(written),
+        `the cell still holds something unrunnable: ${JSON.stringify(written)}`
+      );
+    } finally {
+      vscode.window.activeNotebookEditor = undefined;
+      await extension.deactivate();
+    }
+  });
 });
 
 test('a hung CLI is given up on instead of wedging the extension', async () => {

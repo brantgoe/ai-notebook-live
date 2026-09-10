@@ -49,6 +49,15 @@ let insertLock = Promise.resolve();
  * '```python\rprint(1)\r```' produced '' in both modes.
  */
 const LINE_START = String.raw`(^|\n|\r(?!\n))`;
+/**
+ * CommonMark allows a closing fence to be indented up to three spaces, and
+ * models routinely indent fences inside a numbered list. The OPENER is already
+ * de-indented by the leading-whitespace strip, which made this asymmetric and
+ * easy to hit: the body came back with `  ``` ` still in it, guaranteeing a
+ * SyntaxError in the cell. Applied to streaming and final alike, or final's
+ * candidates would stop being a subset of streaming's.
+ */
+const INDENT = ' {0,3}';
 
 function unfence(raw, { final = false } = {}) {
   const lead = raw.replace(/^\s+/, '');
@@ -63,11 +72,11 @@ function unfence(raw, { final = false } = {}) {
   const nl = lead.search(/\n|\r(?!\n)/);
   if (nl === -1) return '';
   const afterOpen = lead.slice(nl + 1);
-  const close = afterOpen.search(new RegExp(`${LINE_START}\`\`\``));
+  const close = afterOpen.search(new RegExp(`${LINE_START}${INDENT}\`\`\``));
   if (close !== -1) return afterOpen.slice(0, close);
   // No closing fence yet: hold back a tail that could turn out to be one,
   // because text already written into the cell must never be retracted.
-  return afterOpen.replace(new RegExp(`(?:${LINE_START})\`{0,2}$`), '');
+  return afterOpen.replace(new RegExp(`(?:${LINE_START})${INDENT}\`{0,2}$`), '');
 }
 
 function unfenceFinal(lead) {
@@ -85,7 +94,7 @@ function unfenceFinal(lead) {
   // code itself contained, which is how a docstring lost its second half.
   // Same line-start rule as streaming, so final's candidates stay a SUBSET of
   // streaming's - which is the whole reason final can only ever be longer.
-  const closer = new RegExp(`${LINE_START}${open[1]}\`*[ \\t\\r]*(?=\\r|\\n|$)`, 'g');
+  const closer = new RegExp(`${LINE_START}${INDENT}${open[1]}\`*[ \\t\\r]*(?=\\r|\\n|$)`, 'g');
   let at = -1;
   let m = closer.exec(body);
   while (m !== null) {
@@ -195,10 +204,20 @@ class CellWriter {
       await apply(edit, 'insert a cell into the notebook');
       // Claim the cell by identity rather than by index, so a foreign edit that
       // lands during the await cannot hand us somebody else's cell.
-      const created = notebook
+      //
+      // Nearest the index we asked for, not merely the first unrecognised cell
+      // in document order. find() returned whichever new cell came first in the
+      // notebook, so a user pressing "+ Code" ABOVE during the applyEdit window
+      // made this claim THEIR brand-new cell and stream into it - the exact
+      // scenario the identity check exists to prevent, answered with the wrong
+      // cell. Measured.
+      const fresh = notebook
         .getCells()
-        .find((c) => !before.has(c.document.uri.toString()));
-      if (!created) throw new Error('The inserted cell could not be found.');
+        .filter((c) => !before.has(c.document.uri.toString()));
+      if (!fresh.length) throw new Error('The inserted cell could not be found.');
+      const created = fresh.reduce((best, c) =>
+        Math.abs(c.index - at) < Math.abs(best.index - at) ? c : best
+      );
       return created;
     });
     insertLock = run.then(
@@ -496,6 +515,23 @@ async function runApproved(notebook, index, approved) {
   return true;
 }
 
+/**
+ * Cut a string to length without splitting a surrogate pair in half.
+ *
+ * slice() works on UTF-16 code units, so cutting mid-emoji leaves a lone
+ * surrogate - which cannot be encoded as UTF-8 at all. Measured: /cells handed
+ * back `source` that this project's OWN cellText then refused on the way back
+ * in, so a read-modify-write client broke on our own output; and clipped prompt
+ * context reached the model as U+FFFD.
+ */
+function clipText(s, limit) {
+  if (s.length <= limit) return s;
+  let head = s.slice(0, limit);
+  const last = head.charCodeAt(head.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1);
+  return `${head}\n...<truncated>`;
+}
+
 const OUTPUT_MIMES = [
   'application/vnd.code.notebook.stdout',
   'application/vnd.code.notebook.stderr',
@@ -538,7 +574,7 @@ function readOutputs(cell, { limit = 1200 } = {}) {
   const clip = (s) => {
     if (s.length <= limit) return s;
     truncated = true;
-    return `${s.slice(0, limit)}\n...<truncated>`;
+    return clipText(s, limit);
   };
   const error = errors.length ? clip(errors.join('\n\n')) : '';
   const text_ = text.length ? clip(text.join('')) : '';
@@ -547,6 +583,7 @@ function readOutputs(cell, { limit = 1200 } = {}) {
 
 module.exports = {
   CellWriter,
+  clipText,
   runCell,
   runApproved,
   readOutputs,
