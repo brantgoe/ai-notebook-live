@@ -6,8 +6,8 @@ Claude Code login, no API key required.**
 The code appears in the cell, token by token, in the notebook you already have
 open. Not in a side panel you copy out of, and not on disk behind a stale tab.
 
-There is also a localhost bridge, so other AI tools on your machine can add
-cells to the open notebook. That is off by default.
+There is also a localhost bridge, so other AI tools on your machine can read
+the open notebook and write cells into it. That is off by default.
 
 > Not affiliated with, endorsed by, or sponsored by Anthropic.
 > Claude is a trademark of Anthropic, PBC.
@@ -28,9 +28,18 @@ needs VS Code's `NotebookEdit` API, which is what this extension uses.
 ## Install
 
 1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
-2. ```bash
-   code --install-extension ai-notebook-live-0.5.0.vsix
+2. In VS Code: **Extensions** view → the `...` menu at its top right → **Install
+   from VSIX...** → pick the file you downloaded.
+
+   Or, from a terminal you have already `cd`'d into the download folder:
+
+   ```bash
+   code --install-extension ai-notebook-live-<version>.vsix
    ```
+
+   On a Mac the `code` command does not exist until you run **Shell Command:
+   Install 'code' command in PATH** from the command palette, so the menu route
+   above is the shorter one.
 3. Reload the window.
 
 You also need the **Jupyter** extension and a Python kernel to *run* cells;
@@ -39,7 +48,9 @@ without them the extension still writes cells, it just cannot execute them.
 ### Updating
 
 Installs are manual, so nothing will prompt you. Grab the newer `.vsix` from
-Releases and run the same command — `--force` if it complains — then reload.
+Releases and install it the same way — `--force` if the CLI complains — then
+reload. Going **back** works the same way: install an older `.vsix` from
+Releases and reload.
 [CHANGELOG.md](CHANGELOG.md) says whether it is worth it.
 
 ## Setup
@@ -55,7 +66,10 @@ Two ways to reach a model:
 | **Claude Code CLI** *(default)* | Install [Claude Code](https://claude.com/claude-code) and log in | Uses your existing plan |
 | **Anthropic API** | `AI Notebook: Set Anthropic API Key` | Billed per token |
 
-With `provider` on `auto` a stored key wins; otherwise the CLI is used. If the
+With `provider` on `auto` an API key wins — one you stored, **or one exported
+as `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` in your shell**, which is easy
+to forget you did and is billed per token. Set `provider` to `claude-cli` to
+always use your Claude Code plan. Otherwise the CLI is used. If the
 `claude` command is somewhere unusual, set `aiNotebookLive.claudePath` — the
 error message offers to do it for you.
 
@@ -63,8 +77,8 @@ error message offers to do it for you.
 
 | Command | Key | What it does |
 |---|---|---|
-| Generate Cell with AI… | `Ctrl+Alt+G` | Describe a cell; it is written below the selection |
-| Revise This Cell with AI… | `Ctrl+Alt+R` | Rewrites the selected cell from your instruction |
+| Generate Cell with AI… | `Ctrl+Alt+G` (`Cmd+Alt+G` on a Mac) | Describe a cell; it is written below the selection |
+| Revise This Cell with AI… | `Ctrl+Alt+R` (`Cmd+Alt+R` on a Mac) | Rewrites the selected cell from your instruction |
 | Fix the Error in This Cell | — | Sends the cell and its traceback, and rewrites it |
 | Explain This Cell | — | Adds a markdown explanation *above* the cell |
 | Control Panel | — | Provider, execution policy, bridge state |
@@ -143,14 +157,22 @@ POST /cell/stream    raw body, streamed into the cell as it arrives
 
 Query parameters — and only the query string: `kind=code|markdown`,
 `position=below|above|end|<whole number>`, `run=0|1`,
-`notebook=<path fragment>`, `language=<kernel language>`. The body carries the
-content and nothing else.
+`notebook=<path fragment>`, `language=<kernel language>`. On `/cells`:
+`from=`, `to=`, `outputs=1`. On `/cell/replace`: `index=` and `expect=`. The
+body carries the content and nothing else.
 
-The bridge refuses rather than guesses. `400` for a body that is not a JSON
-object, a body that produces no content, an unrecognised `kind`, or a
-`position` that is not a whole number. `409` when no notebook is open, or when
-`notebook=` matches none of the open ones — it will not quietly write somewhere
-else. `413` for a body over 1 MiB.
+`expect=` is the current source of the cell you are replacing, as you last read
+it. Pass it: the replace is then refused if the cell has changed since, instead
+of destroying something you have not seen. `/cells` clips a long cell and marks
+that cell `truncated` — never replace one of those from what you were shown.
+
+The bridge refuses rather than guesses. `401` without the token. `400` for a
+body that is not a JSON object, a body that produces no content — including for
+`/cell/replace`, which will not blank a cell for you — an unrecognised `kind`,
+or a `position` that is not a whole number. `404` for an unknown path, `405` for
+the wrong method. `409` when no notebook is open, when `notebook=` matches none
+of the open ones — it will not quietly write somewhere else — or when `expect=`
+does not match. `413` for a body over 1 MiB.
 
 ## Letting other AI tools write here
 
@@ -170,7 +192,7 @@ in the control panel) and paste what it gives you:
 codex mcp add ai-notebook -- node <path to bin/mcp-server.js>
 ```
 
-Then restart Codex. It gets two tools:
+Then restart Codex. It gets four tools:
 
 | tool | what it does |
 |---|---|
@@ -198,8 +220,10 @@ to `never` — an agent can ask, and never override you.
   workspace.
 
 **What it still means:** while the bridge is running, any program on your
-machine that can read `~/.ai-notebook-live/` can add cells to your notebook —
-and run them, if you have set `bridge.execution` to allow it. That is the point
+machine that can read `~/.ai-notebook-live/` can **read** your notebook —
+including cell outputs, which may hold data or keys you printed — **add** cells,
+and **overwrite** existing ones. It can run them too, if you have set
+`bridge.execution` to allow it. That is the point
 of the feature, and it is why it is off by default. On Windows the file modes
 above are not meaningfully enforced by the OS.
 
@@ -249,7 +273,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 109 tests, no VS Code needed
+npm test          # 111 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

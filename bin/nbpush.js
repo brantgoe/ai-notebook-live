@@ -22,6 +22,18 @@ const http = require('http');
 const INFO_DIR = process.env.AI_NOTEBOOK_LIVE_HOME || path.join(os.homedir(), '.ai-notebook-live');
 const INFO_FILE = path.join(INFO_DIR, 'bridge.json');
 
+/**
+ * Thrown instead of calling process.exit, so that argv validation can actually
+ * be tested. It could not be before: every invalid-argument path exited the
+ * process, which in a test run means killing the test run.
+ */
+class CliExit extends Error {
+  constructor(code) {
+    super(`nbpush exited with ${code}`);
+    this.code = code;
+  }
+}
+
 function usage(code) {
   process.stderr.write(
     [
@@ -34,11 +46,15 @@ function usage(code) {
       '  --run               execute the cell after inserting it',
       '  --no-run            do not execute it (overrides the VS Code setting)',
       '  --notebook <part>   pick the open notebook whose path contains <part>',
+      '  --kind <code|markdown>  which kind of cell to insert',
+      '  --list              list the live cells and their indexes, then exit',
+      '  --replace <index>   rewrite that cell instead of inserting a new one',
       '  --health            print bridge status and exit',
+      '  --dry-run           show what would be pushed, and where, without pushing',
       '',
     ].join('\n')
   );
-  process.exit(code);
+  throw new CliExit(code);
 }
 
 function fail(message) {
@@ -49,6 +65,10 @@ function fail(message) {
 const FLAGS = new Set([
   '--code', '--file', '--markdown', '--md', '--kind', '--position', '-p',
   '--run', '--no-run', '--notebook', '--health', '--dry-run', '-h', '--help',
+  // Announced in the 0.5.0 CHANGELOG, handled further down, and never actually
+  // parsed - both fell through to "unexpected argument" and exit 2, while the
+  // code reading args.list and args.replace sat there unreachable.
+  '--list', '--replace',
 ]);
 
 function parseArgs(argv) {
@@ -96,6 +116,12 @@ function parseArgs(argv) {
     } else if (arg === '--notebook') {
       once('notebook', '--notebook');
       out.notebook = next('--notebook');
+    } else if (arg === '--list') out.list = true;
+    else if (arg === '--replace') {
+      once('replace', '--replace');
+      const value = next('--replace');
+      if (!/^\d+$/.test(value)) fail(`--replace needs a cell index, not ${value}`);
+      out.replace = Number(value);
     } else if (arg === '--health') out.health = true;
     else if (arg === '--dry-run') out.dryRun = true;
     else if (arg === '-h' || arg === '--help') usage(0);
@@ -104,6 +130,12 @@ function parseArgs(argv) {
   }
   if (out.code !== undefined && out.file !== undefined) {
     fail('--code and a file cannot both be given');
+  }
+  if (out.replace !== undefined && out.position !== undefined) {
+    fail('--replace rewrites an existing cell, so --position means nothing');
+  }
+  if (out.replace !== undefined && out.list) {
+    fail('--list and --replace cannot both be given');
   }
   if (out.kind === undefined) out.kind = 'code';
   return out;
@@ -343,6 +375,21 @@ async function main() {
       search: args.replace !== undefined ? `index=${encodeURIComponent(args.replace)}` : search.toString(),
       body: JSON.stringify({ code }),
     });
+  } else if (args.replace !== undefined) {
+    // Replacing takes a whole body, not a stream, and the streaming branch below
+    // ignores args.replace entirely - so `--replace 2` on a pipe silently
+    // APPENDED a new cell instead of rewriting cell 2. That is the additive-vs-
+    // destructive confusion this endpoint exists to keep apart, and it damaged a
+    // real notebook. Read stdin to the end, then replace.
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    const code = Buffer.concat(chunks).toString('utf8');
+    res = await request(info, {
+      method: 'POST',
+      pathname: '/cell/replace',
+      search: `index=${encodeURIComponent(args.replace)}`,
+      body: JSON.stringify({ code }),
+    });
   } else {
     // Stream stdin so a generator's output appears in the notebook as it is produced.
     res = await request(info, {
@@ -370,9 +417,10 @@ async function main() {
 
 if (require.main === module) {
   main().catch((err) => {
+    if (err instanceof CliExit) return process.exit(err.code);
     process.stderr.write(`nbpush: ${(err && err.message) || err}\n`);
-    process.exit(1);
+    return process.exit(1);
   });
 }
 
-module.exports = { parseArgs, chooseInput, readInfo, alive, INFO_FILE };
+module.exports = { parseArgs, chooseInput, readInfo, alive, INFO_FILE, CliExit };

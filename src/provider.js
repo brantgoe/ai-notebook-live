@@ -417,7 +417,13 @@ function streamCli({ system, user, opts, token, onText, binary }) {
         log('claude CLI exited', String(code), said);
         return reject(
           new ProviderError(
-            `The \`claude\` CLI exited with code ${code}. ${said.split('\n').slice(-2).join(' ')}`.trim()
+            // The likeliest first-run failure by far is "installed but not
+            // signed in", which exits non-zero with nothing useful on stderr.
+            // An exit code is not an explanation for the audience this is for.
+            said
+              ? `The \`claude\` CLI failed: ${said.split('\n').slice(-2).join(' ')}`.trim()
+              : 'The `claude` command ran but did not answer. If you have not signed in yet, ' +
+                'open a terminal, run `claude`, and follow the login prompt.'
           )
         );
       }

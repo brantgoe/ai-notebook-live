@@ -266,7 +266,7 @@ async function showControlPanel() {
       label: '$(plug) Agent bridge',
       description: running ? `running on 127.0.0.1:${state.bridge.port}` : 'stopped',
       detail: running
-        ? 'Any program on this machine holding the token can add cells to this notebook.'
+        ? 'Any program on this machine holding the token can read this notebook, add cells, and overwrite existing ones.'
         : 'Let other AI tools write into this notebook.',
       act: async () => {
         if (running) await vscode.commands.executeCommand('aiNotebookLive.stopBridge');
@@ -392,7 +392,8 @@ function busy(label) {
 async function guard(label, body) {
   if (state.active) {
     const pick = await vscode.window.showWarningMessage(
-      'AI Notebook Live is already writing a cell.',
+      'AI Notebook Live is still writing a cell. It gives up on its own after ' +
+        `${Math.round((Number(settings().timeoutSeconds) || 300) / 60)} minutes with no output.`,
       'Cancel it'
     );
     // Re-read: the generation may well have finished while this dialog sat
@@ -504,7 +505,9 @@ async function startBridge(announce) {
     renderStatus();
     if (announce) {
       const pick = await vscode.window.showInformationMessage(
-        `Agent bridge listening on 127.0.0.1:${port}. Agents can POST cells into this notebook.`,
+        `The agent bridge is on (127.0.0.1:${port}). Any program on this computer that can read the ` +
+          'token file can now read this notebook — including cell outputs — add cells, and overwrite ' +
+          'existing ones. Nothing runs unless you allow it. Turn it off in the control panel.',
         'Copy Example Command',
         'Show Log'
       );
@@ -545,7 +548,7 @@ function targetNotebook(hint) {
 
 function requireEditor() {
   const editor = vscode.window.activeNotebookEditor;
-  if (!editor) throw new Error('open a notebook first - there is no active notebook editor.');
+  if (!editor) throw new Error('click inside a notebook cell first, then try again.');
   return editor;
 }
 

@@ -803,6 +803,50 @@ test('settings are clamped, so a bad value cannot become a bad request', async (
 
 const nbpush = require(path.join('..', 'bin', 'nbpush.js'));
 
+test('nbpush --replace and --list actually parse', () => {
+  // Both were announced in the 0.5.0 CHANGELOG and handled further down in the
+  // file, and neither was ever added to the parser - so both hit "unexpected
+  // argument" and exit 2 while the code reading them sat unreachable.
+  const listed = nbpush.parseArgs(['--list']);
+  assert.strictEqual(listed.list, true);
+  const rep = nbpush.parseArgs(['--replace', '2']);
+  assert.strictEqual(rep.replace, 2);
+});
+
+test('nbpush --replace on a pipe replaces, and never appends', async () => {
+  // The bug that put a junk cell in a real notebook. --replace only routed to
+  // /cell/replace when the content came from --code or --file; with piped stdin
+  // it fell through to the streaming branch, which ignores the flag entirely -
+  // so it silently ADDED a cell instead of rewriting one. Additive and
+  // destructive are exactly the two things this endpoint keeps apart.
+  const original = 'keep = "me"';
+  const notebook = newNotebook(['first', original]);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const res = await call(port, token, {
+      path: `/cell/replace?index=1&expect=${encodeURIComponent(original)}`,
+      body: JSON.stringify({ code: 'keep = "replaced"' }),
+    });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(notebook.cellCount, 2, 'replacing must never add a cell');
+    assert.strictEqual(notebook.cellAt(1).document.getText(), 'keep = "replaced"');
+    // And the routing itself: with a pipe, --replace must not reach /cell.
+    const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'nbpush.js'), 'utf8');
+    const streamBranch = src.slice(src.indexOf('// Stream stdin'));
+    assert.ok(
+      !/pathname: '\/cell\/stream'[\s\S]{0,400}args\.replace/.test(streamBranch),
+      'the streaming branch must not be reachable with --replace'
+    );
+  } finally {
+    await bridge.stop();
+  }
+});
+
 test('nbpush refuses to hang on a terminal instead of waiting forever', () => {
   // Run with nothing piped in, nbpush used to block on stdin indefinitely - and
   // the bridge had already put an empty cell in the notebook by then.
@@ -819,15 +863,12 @@ test('nbpush refuses to hang on a terminal instead of waiting forever', () => {
 });
 
 test('nbpush rejects contradictory arguments instead of quietly picking one', () => {
-  const rejected = [];
+  // No process.exit monkeypatching any more: usage() throws CliExit, which is
+  // what makes argv validation testable at all rather than something that kills
+  // the test run.
   const realWrite = process.stderr.write;
-  const realExit = process.exit;
   process.stderr.write = () => true;
-  process.exit = (code) => {
-    const err = new Error(`exit ${code}`);
-    err.exitCode = code;
-    throw err;
-  };
+  const rejected = [];
   try {
     for (const argv of [
       ['--run', '--no-run'], //          decides whether code runs in your kernel
@@ -838,18 +879,20 @@ test('nbpush rejects contradictory arguments instead of quietly picking one', ()
       ['--kind', 'banana'],
       ['--position'], //                 missing value
       ['--nope'],
+      ['--replace', 'two'], //           a destructive flag must not guess
+      ['--replace', '1', '--position', 'end'],
+      ['--list', '--replace', '1'],
     ]) {
       let threw = false;
       try {
         nbpush.parseArgs(argv);
       } catch (err) {
-        threw = err.exitCode === 2;
+        threw = err instanceof nbpush.CliExit && err.code === 2;
       }
       if (!threw) rejected.push(argv.join(' '));
     }
   } finally {
     process.stderr.write = realWrite;
-    process.exit = realExit;
   }
   assert.deepStrictEqual(rejected, [], 'these argument combinations must be refused');
 });

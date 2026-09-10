@@ -2,7 +2,7 @@
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
   "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let other AI tools \u2014 Codex included \u2014 add cells to the notebook you have open.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {
@@ -103,13 +103,13 @@
         "command": "aiNotebookLive.generate",
         "key": "ctrl+alt+g",
         "mac": "cmd+alt+g",
-        "when": "notebookEditorFocused && !inputFocus && !aiNotebookLive.generating"
+        "when": "notebookEditorFocused && !aiNotebookLive.generating"
       },
       {
         "command": "aiNotebookLive.reviseCell",
         "key": "ctrl+alt+r",
         "mac": "cmd+alt+r",
-        "when": "notebookEditorFocused && !inputFocus && !aiNotebookLive.generating"
+        "when": "notebookEditorFocused && !aiNotebookLive.generating"
       }
     ],
     "menus": {
