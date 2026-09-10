@@ -327,6 +327,110 @@ test('produced, end and abandon all agree about what the model produced', async 
   assert.strictEqual(partial, '`x`', 'and abandon() hands back the same content');
 });
 
+test('a user typing into a streaming cell keeps their text', async () => {
+  // The cell is a full reconcile target, so the next flush used to overwrite
+  // whatever the user had typed with the model's version of the cell.
+  const notebook = newNotebook(['seed = 1']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  writer.write('line1\n');
+  await writer.flush();
+
+  notebook.cellAt(1).document.text = 'USER TYPED THIS';
+  writer.write('line2\n');
+  await writer.flush();
+
+  assert.strictEqual(
+    notebook.cellAt(1).document.getText(),
+    'USER TYPED THIS',
+    'the AI must not write over a person'
+  );
+  assert.ok(writer.foreign, 'and it knows it lost the cell');
+  assert.ok(!writer.failed, 'a foreign edit is not an error');
+  const text = await writer.end();
+  assert.strictEqual(text, 'USER TYPED THIS', 'end() reports the document, not the intent');
+});
+
+test('a cell the user edited is never executed', async () => {
+  // The dangerous half of the fix: end() now returns the USER'S text, and that
+  // text used to flow straight into the execution policy.
+  const extension = require(path.join('..', 'extension.js'));
+  const notebook = newNotebook(['answer = 42']);
+  const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+  vscode.window.visibleNotebookEditors.push(editor);
+  vscode.window.activeNotebookEditor = editor;
+  vscode.__test.config.set('aiNotebookLive.execution', 'always');
+  vscode.__test.executed.length = 0;
+
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  writer.write('print("generated")');
+  await writer.flush();
+  notebook.cellAt(1).document.text = 'import os  # half typed';
+  writer.write(' more');
+  await writer.flush();
+  try {
+    assert.ok(writer.foreign);
+    assert.strictEqual(
+      vscode.__test.executed.length,
+      0,
+      'nothing the user typed may be executed under an AI grant'
+    );
+  } finally {
+    vscode.__test.config.clear();
+    vscode.window.activeNotebookEditor = undefined;
+    vscode.window.visibleNotebookEditors.length = 0;
+  }
+});
+
+test('an autosave that trims trailing whitespace does not stop the stream', async () => {
+  // The one false positive worth tolerating: a save is not a person typing.
+  const notebook = newNotebook(['seed = 1']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  writer.write('print(1)\n\n');
+  await writer.flush();
+  notebook.cellAt(1).document.text = 'print(1)';
+  writer.write('print(2)\n');
+  await writer.flush();
+  assert.ok(!writer.foreign, 'trailing whitespace alone must not look like an edit');
+  assert.match(notebook.cellAt(1).document.getText(), /print\(2\)/, 'and the stream continues');
+});
+
+test('end() after abandon() cannot resurrect the discarded partial', async () => {
+  // end()'s final write used force:true, which bypassed the closed guard and
+  // overwrote the original that abandon() had just restored.
+  const notebook = newNotebook(['answer = 42  # hard-won']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('answer = ');
+  await writer.abandon();
+  await assert.rejects(() => writer.end(), /abandoned/);
+  assert.strictEqual(
+    notebook.cellAt(0).document.getText(),
+    'answer = 42  # hard-won',
+    'the restore stands'
+  );
+});
+
+test('keeping what the AI wrote still works after a restore', async () => {
+  // Making force stop being a bypass would otherwise silently break the
+  // recovery button, which is the only way back to the partial.
+  const notebook = newNotebook(['answer = 42']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('answer = 43');
+  const { partial } = await writer.abandon();
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'answer = 42');
+  assert.ok(await writer.keepPartial(partial), 'the user can ask for the partial back');
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'answer = 43');
+});
+
+test('abandon() is idempotent', async () => {
+  const notebook = newNotebook(['orig']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('partial');
+  await writer.abandon();
+  await writer.abandon();
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'orig');
+  assert.strictEqual(notebook.cellCount, 1);
+});
+
 test('a failed replace hands the cell back exactly as it was', async () => {
   const notebook = newNotebook(['answer = 42  # hard-won']);
   const writer = await CellWriter.replace(notebook, notebook.cellAt(0));

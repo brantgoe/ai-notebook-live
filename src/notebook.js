@@ -130,6 +130,16 @@ class CellWriter {
     this.flushing = Promise.resolve();
     this.closed = false;
     this.failed = undefined;
+    // What we last put in the document. Anything else there means somebody
+    // else has been editing, and we are no longer the owner of this cell.
+    this.written = original;
+    // Set once the cell has been handed back or removed. Distinct from `closed`,
+    // which only means "no more streaming".
+    this.released = false;
+    // Set when the document diverged from `written` - the user typed. Kept
+    // separate from `failed` on purpose: a foreign edit is not an error, and
+    // end() must not throw for it.
+    this.foreign = false;
   }
 
   /** True once the model has produced text worth keeping. */
@@ -242,11 +252,21 @@ class CellWriter {
 
   async setText(target, { force = false } = {}) {
     if (this.closed && !force) return;
+    // A released writer owns nothing. `force` used to bypass this, which is how
+    // end() could overwrite a restore that abandon() had just performed.
+    if (this.released) return;
     const cell = this.cell();
     if (!cell) return;
     const doc = cell.document;
     const current = doc.getText();
     if (current === target) return;
+    if (!this.owns(current)) {
+      // Somebody typed into the cell we were streaming into. Stop rather than
+      // overwrite: the model's text is still in `raw` and can be offered, but
+      // what the user typed cannot be reconstructed.
+      this.foreign = true;
+      return;
+    }
     // Rewrite only the tail that actually changed, so the editor does not
     // re-render the whole cell on every token.
     let keep = 0;
@@ -259,6 +279,26 @@ class CellWriter {
       target.slice(keep)
     );
     await apply(edit, 'write into the cell');
+    // Recorded only after the edit lands, so our own writes never look foreign.
+    this.written = target;
+  }
+
+  /**
+   * Is the document still exactly what we last put there?
+   *
+   * A save can trim trailing whitespace out from under us, which is not a person
+   * typing, so that one difference is tolerated - setText diffs against the
+   * document rather than against `written`, so it self-corrects on the next
+   * write. Anything else means the user is in the cell.
+   *
+   * Not airtight: there is an await between reading the document and the edit
+   * landing, so a keystroke inside that window is still lost. The window is one
+   * event-loop turn rather than the 60ms flush interval, and the next write
+   * notices. It stops; it never reverts.
+   */
+  owns(current) {
+    if (current === this.written) return true;
+    return current.replace(/\s+$/, '') === this.written.replace(/\s+$/, '');
   }
 
   /**
@@ -269,6 +309,12 @@ class CellWriter {
    * Execution is deliberately not decided here; see src/policy.js.
    */
   async end({ trim = true } = {}) {
+    // A writer that has handed its cell back has nothing left to finish. This is
+    // a programming error rather than a user-visible one, and throwing is what
+    // keeps it unreachable.
+    if (this.released) {
+      throw new Error('this cell was abandoned; there is nothing left to finish.');
+    }
     // Close BEFORE awaiting: a write landing during these awaits used to arm a
     // timer that nothing afterwards would ever clear.
     this.closed = true;
@@ -300,6 +346,8 @@ class CellWriter {
    * Never called for a cancellation: someone who cancels keeps what arrived.
    */
   async abandon() {
+    // Idempotent: the bridge can reach this twice through nested catches.
+    if (this.released) return { restored: false, partial: this.text({ final: true }) };
     this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -316,11 +364,35 @@ class CellWriter {
         vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(cell.index, cell.index + 1)),
       ]);
       await apply(edit, 'remove the cell');
+      this.released = true;
       return { restored: true, partial };
     }
 
+    // Restore first, release second: releasing early would refuse our own
+    // restoring write.
     await this.setText(this.original, { force: true });
+    this.released = true;
     return { restored: true, partial };
+  }
+
+  /**
+   * Put the model's partial back after a restore, because the user asked for it.
+   *
+   * This deliberately re-acquires the cell that abandon() released, and is the
+   * only way back in. `force` used to serve this purpose, and `force` was also
+   * what let end() silently overwrite a restore.
+   */
+  async keepPartial(text) {
+    const cell = this.cell();
+    if (!cell) return false;
+    this.released = false;
+    this.foreign = false;
+    // The user may have edited since the restore, so re-sync rather than
+    // assuming we still know what is there.
+    this.written = cell.document.getText();
+    await this.setText(text, { force: true });
+    this.released = true;
+    return true;
   }
 
   /** Back-compat alias; the bridge still calls this. Removed in phase 4. */

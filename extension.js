@@ -581,8 +581,14 @@ async function pump({ writer, system, user, opts, token, target, intent, request
           `AI Notebook Live: that failed partway, so your cell was put back. Ctrl+Z brings back the ${lines} line${lines === 1 ? '' : 's'} the AI had written.`,
           'Keep what the AI wrote'
         )
-        .then((pick) => {
-          if (pick) writer.setText(partial, { force: true });
+        .then(async (pick) => {
+          if (!pick) return;
+          const kept = await writer.keepPartial(partial);
+          if (!kept) {
+            vscode.window.showWarningMessage(
+              'AI Notebook Live: that cell is gone, so there was nothing to put back.'
+            );
+          }
         });
     }
     throw err;
