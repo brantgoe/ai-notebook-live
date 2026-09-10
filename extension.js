@@ -611,6 +611,75 @@ function reportStop(gaveUp, silence) {
     });
 }
 
+/**
+ * Undo a failed generation, and offer the partial back when that is safe.
+ *
+ * Shared by both failure paths - the stream throwing, and the final reconcile
+ * throwing - because the second one used to skip all of this.
+ *
+ * The distinction that matters is whether the cell was actually put back.
+ * abandon() declines to restore when the user has typed into the cell, since it
+ * cannot overwrite what they wrote. This used to say "your cell was put back"
+ * regardless, which was false exactly when it mattered most, and then offered a
+ * button that wrote the AI's partial over their typing - losing the original
+ * AND the typing, with a message that told them the opposite.
+ */
+async function undoAndOffer(writer) {
+  // The writer knows what undoing itself means: delete a cell we created, hand
+  // back a cell we borrowed. pump does not have to be told.
+  let restored;
+  let partial;
+  try {
+    ({ restored, partial } = await writer.abandon());
+  } catch (err) {
+    // Whatever stopped the write usually stops the undo too - a read-only
+    // notebook fails both. This must not replace the original error, which is
+    // the one that explains what actually happened.
+    log('could not undo the failed generation:', err && err.message);
+    vscode.window.showWarningMessage(
+      'AI Notebook Live: that failed partway and the cell could not be put back — the notebook may be ' +
+        'read-only or closed. Ctrl+Z steps back to how it looked before the AI started.'
+    );
+    return;
+  }
+  if (writer.origin !== 'replace' || !partial.trim()) return;
+
+  if (!restored) {
+    if (writer.foreign) {
+      vscode.window.showWarningMessage(
+        'AI Notebook Live: that failed partway. You had edited the cell, so it was left exactly as you typed it - ' +
+          'nothing of yours was overwritten. Ctrl+Z steps back to how it looked before the AI started.'
+      );
+    } else {
+      vscode.window.showWarningMessage(
+        'AI Notebook Live: that failed partway and the cell could not be put back - it may have been removed or the ' +
+          'notebook may be read-only. Ctrl+Z steps back to how it looked before the AI started.'
+      );
+    }
+    return;
+  }
+
+  const lines = partial.split('\n').length;
+  vscode.window
+    .showWarningMessage(
+      `AI Notebook Live: that failed partway, so your cell was put back. Ctrl+Z brings back the ${lines} line${lines === 1 ? '' : 's'} the AI had written.`,
+      'Keep what the AI wrote'
+    )
+    .then(async (pick) => {
+      if (!pick) return;
+      const kept = await writer.keepPartial(partial);
+      if (!kept) {
+        vscode.window.showWarningMessage(
+          'AI Notebook Live: that cell has changed since, so there was nothing safe to put back.'
+        );
+      }
+    })
+    // Deliberately not awaited - pump must not hold the command open waiting on
+    // a dialog - but the rejection used to be unhandled. keepPartial is what
+    // makes the delay safe: it refuses if the cell moved on meanwhile.
+    .then(undefined, (err) => log('offering the partial back failed:', err && err.message));
+}
+
 /** Runs one streaming request and lands every token in the cell as it arrives. */
 async function pump({ writer, system, user, opts, token, target, intent, requested }) {
   const started = Date.now();
@@ -654,26 +723,7 @@ async function pump({ writer, system, user, opts, token, target, intent, request
     });
   } catch (err) {
     if (idle) clearTimeout(idle);
-    // The writer knows what undoing itself means: delete a cell we created,
-    // hand back a cell we borrowed. pump no longer has to be told.
-    const { partial } = await writer.abandon();
-    if (writer.origin === 'replace' && partial.trim()) {
-      const lines = partial.split('\n').length;
-      vscode.window
-        .showWarningMessage(
-          `AI Notebook Live: that failed partway, so your cell was put back. Ctrl+Z brings back the ${lines} line${lines === 1 ? '' : 's'} the AI had written.`,
-          'Keep what the AI wrote'
-        )
-        .then(async (pick) => {
-          if (!pick) return;
-          const kept = await writer.keepPartial(partial);
-          if (!kept) {
-            vscode.window.showWarningMessage(
-              'AI Notebook Live: that cell is gone, so there was nothing to put back.'
-            );
-          }
-        });
-    }
+    await undoAndOffer(writer);
     throw err;
   }
 
@@ -687,7 +737,21 @@ async function pump({ writer, system, user, opts, token, target, intent, request
     }
   }
 
-  const text = writer.produced() ? await writer.end() : '';
+  let text = '';
+  if (writer.produced()) {
+    try {
+      text = await writer.end();
+    } catch (err) {
+      // end() throws when the final reconcile could not be applied - a
+      // read-only notebook, a cell removed mid-stream, an earlier flush that
+      // failed. This sat OUTSIDE the try above, so it went straight to the
+      // command's error handler with no abandon() at all: the user's cell kept
+      // a half-written AI statement, permanently, and nothing was offered.
+      if (idle) clearTimeout(idle);
+      await undoAndOffer(writer);
+      throw err;
+    }
+  }
   // One gate for every execution in the extension. `fixError` used to bypass
   // the user's setting entirely by hard-coding run:true, which mattered because
   // its prompt is built from cell outputs - text an attacker can influence.

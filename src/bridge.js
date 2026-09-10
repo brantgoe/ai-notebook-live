@@ -277,6 +277,11 @@ class Bridge {
       const writer = await CellWriter.replace(notebook, cell);
       try {
         writer.write(code);
+        // The guard that has always protected /cell, on the one path where the
+        // consequence is destruction rather than clutter. Without it a body of
+        // "", " ", "\n" or "```" answered 200 and BLANKED the cell - measured,
+        // and the fix changed no existing test, which is why it survived.
+        await requireProduced(writer, 'replace');
         const text = await writer.end();
         return send(res, 200, {
           ok: true,
@@ -429,10 +434,7 @@ class Bridge {
     const requested = raw === undefined || raw === null ? undefined : validate.boolish(raw);
     // Nothing usable arrived: take the cell back out rather than leaving an
     // empty one behind. pump() has always done this; the bridge did not.
-    if (!writer.produced()) {
-      await writer.abandon();
-      throw new BridgeError('nothing to insert: the body produced no content', 400);
-    }
+    await requireProduced(writer, 'insert');
     const text = await writer.end();
     const decision = await this.decideRun({
       requested,
@@ -467,6 +469,20 @@ function clampIndex(raw, fallback, count) {
     throw new BridgeError(`from/to must be whole numbers, not ${JSON.stringify(String(raw))}`, 400);
   }
   return Math.min(Math.max(0, n), count);
+}
+
+/**
+ * Refuse a writer that has nothing worth writing, and leave no trace.
+ *
+ * Lifted out of closeWriter so /cell/replace can use it too. Deliberately NOT
+ * by routing replace through closeWriter: that also asks the execution policy,
+ * and a replaced cell has never been executable. Fixing an empty-body bug is
+ * not a reason to hand agents a power they did not have.
+ */
+async function requireProduced(writer, what) {
+  if (writer.produced()) return;
+  await writer.abandon();
+  throw new BridgeError(`nothing to ${what}: the body produced no content`, 400);
 }
 
 function send(res, status, body) {

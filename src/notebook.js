@@ -36,34 +36,56 @@ let insertLock = Promise.resolve();
  * NEVER LOSE CONTENT. Stray fence markers in a cell are an obvious syntax
  * error; a silently discarded half of the answer is not.
  */
+/**
+ * A line start, for fence purposes: the beginning, a newline, or a BARE
+ * carriage return.
+ *
+ * `\r(?!\n)` rather than plain `\r` is load-bearing. Inside CRLF the boundary
+ * has to stay the \n, exactly as before, or the trailing \r that streaming
+ * already emitted would be retracted - see the CRLF note above. A lone \r is a
+ * different thing: it is the only line terminator that string has, and treating
+ * it as ordinary text meant `indexOf('\n')` returned -1, the "body" began at the
+ * opener's own backticks, and the WHOLE CELL came back empty. Measured:
+ * '```python\rprint(1)\r```' produced '' in both modes.
+ */
+const LINE_START = String.raw`(^|\n|\r(?!\n))`;
+
 function unfence(raw, { final = false } = {}) {
   const lead = raw.replace(/^\s+/, '');
   if (!lead) return '';
   if (final) return unfenceFinal(lead);
   // An opening fence may still be arriving ("`", "``", "```pyth"). Emit nothing
   // until we know whether it is a fence and which language tag it carries.
-  if (/^`{1,3}[^\n]*$/.test(lead)) return '';
+  if (/^`{1,3}[^\n\r]*$/.test(lead)) return '';
   if (!lead.startsWith('```')) return lead;
-  const afterOpen = lead.slice(lead.indexOf('\n') + 1);
-  const close = afterOpen.search(/(^|\n)```/);
+  // Where the opener's own line ends. For CRLF this is the \n, so the body
+  // begins in exactly the same place it always did.
+  const nl = lead.search(/\n|\r(?!\n)/);
+  if (nl === -1) return '';
+  const afterOpen = lead.slice(nl + 1);
+  const close = afterOpen.search(new RegExp(`${LINE_START}\`\`\``));
   if (close !== -1) return afterOpen.slice(0, close);
   // No closing fence yet: hold back a tail that could turn out to be one,
   // because text already written into the cell must never be retracted.
-  return afterOpen.replace(/(?:^|\n)`{0,2}$/, '');
+  return afterOpen.replace(new RegExp(`(?:${LINE_START})\`{0,2}$`), '');
 }
 
 function unfenceFinal(lead) {
   // The answer is only fenced if its FIRST line is an opener. This is the branch
   // that used to swallow `x` and `my var` <- 5 whole: a single backtick is not a
   // fence, and at the end there is no "it might still become one".
-  const open = /^(`{3,})[^\n]*(\n|$)/.exec(lead);
+  // \r\n first in the alternation, so CRLF consumes both and the body starts
+  // where it always did; a bare \r is accepted as the terminator it is.
+  const open = /^(`{3,})[^\n\r]*(\r\n|\n|\r|$)/.exec(lead);
   if (!open) return lead;
   if (!open[2]) return ''; // an opener and nothing after it
   const body = lead.slice(open[0].length);
   // The closer is the LAST line that is nothing but the marker - or more of it,
   // which CommonMark allows. Taking the FIRST one truncated at any fence the
   // code itself contained, which is how a docstring lost its second half.
-  const closer = new RegExp(`(^|\\n)${open[1]}\`*[ \\t\\r]*(?=\\n|$)`, 'g');
+  // Same line-start rule as streaming, so final's candidates stay a SUBSET of
+  // streaming's - which is the whole reason final can only ever be longer.
+  const closer = new RegExp(`${LINE_START}${open[1]}\`*[ \\t\\r]*(?=\\r|\\n|$)`, 'g');
   let at = -1;
   let m = closer.exec(body);
   while (m !== null) {
@@ -145,6 +167,9 @@ class CellWriter {
     // separate from `failed` on purpose: a foreign edit is not an error, and
     // end() must not throw for it.
     this.foreign = false;
+    // The text abandon() put back, on the paths where it succeeded. Undefined
+    // means there is nothing for keepPartial() to safely undo.
+    this.restoredTo = undefined;
   }
 
   /** True once the model has produced text worth keeping. */
@@ -255,22 +280,33 @@ class CellWriter {
     return body.replace(/^\n+/, '');
   }
 
+  /**
+   * Returns whether the document now holds `target`.
+   *
+   * This used to return nothing, and every refusal below was therefore silent.
+   * That is what let abandon() report `restored: true` after declining to
+   * restore anything, and the caller then told the user their cell had been put
+   * back when it had not. A refusal the caller cannot see is the bug; the
+   * refusals themselves are all correct.
+   */
   async setText(target, { force = false } = {}) {
-    if (this.closed && !force) return;
+    if (this.closed && !force) return false;
     // A released writer owns nothing. `force` used to bypass this, which is how
     // end() could overwrite a restore that abandon() had just performed.
-    if (this.released) return;
+    if (this.released) return false;
     const cell = this.cell();
-    if (!cell) return;
+    if (!cell) return false;
     const doc = cell.document;
     const current = doc.getText();
-    if (current === target) return;
+    // Already exactly right - nothing to do, but the document does hold the
+    // target, so this is a success and not a refusal.
+    if (current === target) return true;
     if (!this.owns(current)) {
       // Somebody typed into the cell we were streaming into. Stop rather than
       // overwrite: the model's text is still in `raw` and can be offered, but
       // what the user typed cannot be reconstructed.
       this.foreign = true;
-      return;
+      return false;
     }
     // Rewrite only the tail that actually changed, so the editor does not
     // re-render the whole cell on every token.
@@ -286,6 +322,7 @@ class CellWriter {
     await apply(edit, 'write into the cell');
     // Recorded only after the edit lands, so our own writes never look foreign.
     this.written = target;
+    return true;
   }
 
   /**
@@ -375,9 +412,17 @@ class CellWriter {
 
     // Restore first, release second: releasing early would refuse our own
     // restoring write.
-    await this.setText(this.original, { force: true });
+    //
+    // The result is passed on rather than assumed. setText correctly declines
+    // when the user has typed into the cell - it cannot overwrite what they
+    // wrote - and this used to report `restored: true` anyway, so the caller
+    // told them their cell had been put back while their original was gone.
+    const restored = await this.setText(this.original, { force: true });
     this.released = true;
-    return { restored: true, partial };
+    // What the cell holds because of us, so keepPartial can tell "still as I
+    // left it" from "the user has been typing since".
+    this.restoredTo = restored ? this.original : undefined;
+    return { restored, partial };
   }
 
   /**
@@ -386,18 +431,27 @@ class CellWriter {
    * This deliberately re-acquires the cell that abandon() released, and is the
    * only way back in. `force` used to serve this purpose, and `force` was also
    * what let end() silently overwrite a restore.
+   *
+   * Narrow on purpose. It used to re-sync `written` from whatever the document
+   * held, which made owns() pass unconditionally and turned this into a blind
+   * force-write: offered after a restore that had been DECLINED, it overwrote
+   * the very text the user had typed - losing their original and then their
+   * typing too. It now goes ahead only when the cell still holds exactly what
+   * this writer's own restore put there.
    */
   async keepPartial(text) {
+    // Never abandoned, so there is no restore to undo and the cell is live.
+    if (!this.released || this.restoredTo === undefined) return false;
     const cell = this.cell();
     if (!cell) return false;
+    const current = cell.document.getText();
+    if (current !== this.restoredTo) return false;
     this.released = false;
     this.foreign = false;
-    // The user may have edited since the restore, so re-sync rather than
-    // assuming we still know what is there.
-    this.written = cell.document.getText();
-    await this.setText(text, { force: true });
+    this.written = current;
+    const ok = await this.setText(text, { force: true });
     this.released = true;
-    return true;
+    return ok;
   }
 
   /** Back-compat alias; the bridge still calls this. Removed in phase 4. */

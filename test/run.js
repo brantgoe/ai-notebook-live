@@ -276,6 +276,26 @@ test('unfence resolves at the end what streaming had to leave ambiguous', () => 
   }
 });
 
+test('a fence whose lines end in a bare CR keeps its contents', () => {
+  // The only TOTAL silent content loss in the parser: indexOf('\n') returned -1,
+  // so the "body" began at the opener's own backticks, the closing search
+  // matched at position 0, and the whole cell came back empty in BOTH modes -
+  // produced() then said nothing had arrived and the cell was abandoned.
+  assert.strictEqual(unfence('```python\rprint(1)\r```'), 'print(1)');
+  assert.strictEqual(unfence('```python\rprint(1)\r```', { final: true }), 'print(1)');
+  assert.strictEqual(
+    unfence('```py\rimport os\ros.getcwd()', { final: true }),
+    'import os\ros.getcwd()',
+    'an unclosed bare-CR fence hands back the whole body'
+  );
+  assert.strictEqual(unfence('```py\rA\nB\n```'), 'A\nB', 'a CR opener then LF lines');
+
+  // The CRLF contract is a separate thing and must not move: the boundary stays
+  // the \n, so the trailing \r streaming already emitted is never taken back.
+  assert.strictEqual(unfence('```python\r\nprint(1)\r\n```'), 'print(1)\r');
+  assert.strictEqual(unfence('```python\r\nprint(1)\r\n```', { final: true }), 'print(1)\r');
+});
+
 test('final mode never contradicts what streaming already wrote', () => {
   // The property that makes the whole two-mode design safe. Streaming may only
   // ever be extended by the final answer, never rolled back.
@@ -540,6 +560,73 @@ test('a failed replace hands the cell back exactly as it was', async () => {
     'answer = 42  # hard-won',
     'the user gets their own code back, not a half-written statement'
   );
+});
+
+test('abandon() says so when it could NOT put the cell back', async () => {
+  // The worst of the data-loss paths. setText correctly refuses to overwrite a
+  // cell the user has typed into - but abandon() reported restored:true anyway,
+  // so pump told them "your cell was put back" while their original was gone.
+  const notebook = newNotebook(['answer = 42  # took me an hour']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('answer = ');
+  await writer.flush();
+
+  // The user types. The writer stops, as designed.
+  notebook.cellAt(0).document.text = 'answer = MY OWN EDIT';
+
+  const { restored } = await writer.abandon();
+  assert.strictEqual(restored, false, 'it declined to restore, and must say so');
+  assert.ok(writer.foreign, 'and it knows why');
+  assert.strictEqual(
+    notebook.cellAt(0).document.getText(),
+    'answer = MY OWN EDIT',
+    'what the user typed is still exactly there'
+  );
+});
+
+test('"keep what the AI wrote" cannot overwrite what the user typed', async () => {
+  // The button offered by the message above. It re-synced `written` from the
+  // document, which made owns() pass unconditionally and turned it into a blind
+  // force-write: the user lost their original AND their typing.
+  const notebook = newNotebook(['answer = 42  # took me an hour']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('answer = 43');
+  await writer.flush();
+  notebook.cellAt(0).document.text = 'MY NOTES I JUST TYPED';
+
+  await writer.abandon();
+  const kept = await writer.keepPartial('answer = 43');
+  assert.strictEqual(kept, false, 'it must refuse, not overwrite');
+  assert.strictEqual(
+    notebook.cellAt(0).document.getText(),
+    'MY NOTES I JUST TYPED',
+    'the typing survives'
+  );
+});
+
+test('keepPartial refuses on a writer that never abandoned anything', async () => {
+  // Reachable from the floating .then() in pump: the dialog can be answered long
+  // after the command finished, over a cell a later revise is using.
+  const notebook = newNotebook(['live = "content"']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  const kept = await writer.keepPartial('clobber');
+  assert.strictEqual(kept, false, 'there was no restore to undo');
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'live = "content"');
+});
+
+test('keepPartial still works for the case it exists for', async () => {
+  // Guarding it is only correct if the real path survives: a clean restore, then
+  // the user asking for the AI's partial back.
+  const notebook = newNotebook(['original']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('the partial');
+  await writer.flush();
+  const { restored, partial } = await writer.abandon();
+  assert.strictEqual(restored, true);
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'original');
+  const kept = await writer.keepPartial(partial);
+  assert.strictEqual(kept, true, 'the ordinary path must not be broken by the guard');
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'the partial');
 });
 
 test('a writer abandoned after a restore cannot clobber it later', async () => {
@@ -896,6 +983,50 @@ test('reading and replacing go through the bridge, live', async () => {
   }
 });
 
+test('replacing a cell with nothing is refused, not obeyed', async () => {
+  // Answered 200 and BLANKED the cell. /cell has always been guarded against an
+  // empty body; /cell/replace never reached that guard, because it is the one
+  // handler that calls writer.end() directly instead of going through
+  // closeWriter. Same defect class as the old empty-insert bug, on the path
+  // where the consequence is destruction rather than clutter.
+  const original = 'df = pd.read_csv("grades.csv")  # took me all afternoon';
+  const notebook = newNotebook(['import pandas as pd', original]);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    // Whitespace behaves exactly like empty here - produced() is false for both
+    // - and '```' unfences to nothing, so all four must be refused.
+    for (const code of ['', ' ', '\n', '\t\n ', '```']) {
+      const res = await call(port, token, {
+        path: '/cell/replace?index=1',
+        body: JSON.stringify({ code }),
+      });
+      assert.strictEqual(res.status, 400, `${JSON.stringify(code)} must be refused`);
+      assert.match(JSON.parse(res.body).error, /nothing to replace/);
+      assert.strictEqual(
+        notebook.cellAt(1).document.getText(),
+        original,
+        `${JSON.stringify(code)} must leave the cell byte-identical`
+      );
+      assert.strictEqual(notebook.cellCount, 2);
+    }
+
+    // And a real replacement still works, so the guard is not just refusing.
+    const ok = await call(port, token, {
+      path: '/cell/replace?index=1',
+      body: JSON.stringify({ code: 'df = pd.read_csv("grades.csv", index_col=0)' }),
+    });
+    assert.strictEqual(ok.status, 200);
+    assert.strictEqual(JSON.parse(ok.body).replaced, original);
+  } finally {
+    await bridge.stop();
+  }
+});
+
 test('the MCP server speaks enough of the protocol to be driven', async () => {
   const sent = [];
   const realWrite = process.stdout.write;
@@ -975,6 +1106,11 @@ function fakeClaude(scenario) {
       '  if (s === "hang") return;',
       '  if (s === "in_band_failure") return out({ type: "result", subtype: "error_max_turns", result: "ran out of turns" }, () => process.exit(0));',
       '  if (s === "quiet_success") return process.exit(0);',
+      // Two deltas far enough apart that the 60ms flush timer fires between
+      // them, so the cell is already part-written when the stream ends. A single
+      // fast delta produces exactly ONE edit - end()'s own - which is no use for
+      // testing what happens when the final write is the one that fails.
+      '  if (s === "slow") return delta("answer = ", () => setTimeout(() => delta("43", () => out({ type: "result", subtype: "success" }, () => process.exit(0))), 150));',
       '  return delta("print(1)", () => out({ type: "result", subtype: "success" }, () => process.exit(0)));',
       '}, 5);',
     ].join('\n')
@@ -1049,6 +1185,57 @@ test('a genuinely empty success stays quiet', async () => {
     });
     assert.strictEqual(result.provider, 'claude-cli');
     assert.ok(!result.cancelled, 'a quiet success is still a success');
+  });
+});
+
+test('a failure in the FINAL write is undone and explained, not left in the cell', async () => {
+  // pump ran writer.end() OUTSIDE its try. end() throws whenever the last
+  // reconcile cannot be applied - a notebook that went read-only, a cell removed
+  // mid-stream - and that went straight to the command's error handler with no
+  // abandon() at all: the user's cell kept a half-written AI statement and they
+  // were offered nothing.
+  await withFakeClaude('slow', async (binary) => {
+    const extension = require(path.join('..', 'extension.js'));
+    const original = 'answer = 42  # took me all afternoon';
+    const notebook = newNotebook([original]);
+    const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+    vscode.window.visibleNotebookEditors.push(editor);
+    vscode.window.activeNotebookEditor = editor;
+
+    vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+    vscode.__test.config.set('aiNotebookLive.claudePath', binary);
+    vscode.__test.config.set('aiNotebookLive.execution', 'never');
+    vscode.__test.inputs.push('make it handle bad input');
+
+    // A mid-stream flush lands, then the FINAL reconcile fails - the shape of a
+    // notebook that goes read-only, or a cell removed, partway through. The
+    // restore that follows is allowed to succeed, which is the whole point.
+    let seen = 0;
+    vscode.__test.onBeforeApply = () => {
+      seen += 1;
+      vscode.__test.failApplyEdit = seen === 2;
+    };
+
+    const context = {
+      subscriptions: [],
+      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    };
+    extension.activate(context);
+    try {
+      await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+      assert.strictEqual(
+        notebook.cellAt(0).document.getText(),
+        original,
+        'the cell must be put back, not left holding a half-written statement'
+      );
+      const told = vscode.__test.shown.filter((e) => /put back/.test(e.message || ''));
+      assert.strictEqual(told.length, 1, 'and the user must be told, with a way back');
+    } finally {
+      vscode.__test.onBeforeApply = null;
+      vscode.__test.failApplyEdit = false;
+      vscode.window.activeNotebookEditor = undefined;
+      await extension.deactivate();
+    }
   });
 });
 
