@@ -1,28 +1,10 @@
 'use strict';
 const vscode = require('vscode');
+// One-way: validate.js depends on nothing, so this cannot cycle.
+const { clamp, inRangeOr } = require('./validate');
 
 function cfg() {
   return vscode.workspace.getConfiguration('aiNotebookLive');
-}
-
-/** Squeezes a value into range; used where "as much as allowed" is the sane answer. */
-function clamp(value, low, high, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(high, Math.max(low, Math.round(n)));
-}
-
-/**
- * Falls back to the default when a value is out of range, rather than clamping.
- * Used where the nearest legal value would be a surprise in its own right: a
- * contextCells of -7 should not silently mean "send no context", and a port of
- * 80 should not silently mean 1024.
- */
-function inRangeOr(value, low, high, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  const r = Math.round(n);
-  return r >= low && r <= high ? r : fallback;
 }
 
 /** True when the user has set this key anywhere, as opposed to inheriting its default. */

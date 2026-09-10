@@ -40,6 +40,10 @@ function activate(context) {
 
   state.bridge = new Bridge({
     resolveNotebook: (hint) => targetNotebook(hint),
+    listNotebooks: () =>
+      vscode.workspace.notebookDocuments
+        .filter((d) => !d.isClosed)
+        .map((d) => path.basename(d.uri.fsPath)),
     decideRun: (req) => decideExecution({ ...req, intent: 'bridge', opts: settings() }),
   });
 
@@ -436,8 +440,10 @@ function rememberNotebook(editor) {
 function targetNotebook(hint) {
   const open = vscode.workspace.notebookDocuments.filter((d) => !d.isClosed);
   if (hint) {
-    const match = open.find((d) => d.uri.fsPath.includes(String(hint)));
-    if (match) return match;
+    // A hint that matches nothing returns undefined rather than falling through
+    // to the active notebook: silently writing into a different file than the
+    // caller asked for is worse than refusing.
+    return open.find((d) => d.uri.fsPath.includes(String(hint)));
   }
   const active = vscode.window.activeNotebookEditor;
   if (active) return active.notebook;

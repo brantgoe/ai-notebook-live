@@ -147,7 +147,7 @@ class CellWriter {
     // claimed after it: two concurrent inserts used to bind to the same cell,
     // and one agent's content would silently overwrite the other's.
     const run = insertLock.then(async () => {
-      const at = Math.max(0, Math.min(index, notebook.cellCount));
+      const at = Math.max(0, Math.min(Math.floor(index) || 0, notebook.cellCount));
       const before = new Set(notebook.getCells().map((c) => c.document.uri.toString()));
       const data = new vscode.NotebookCellData(cellKind, '', lang);
       const edit = new vscode.WorkspaceEdit();

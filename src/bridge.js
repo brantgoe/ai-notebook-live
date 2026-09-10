@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { CellWriter, editorFor, runCell } = require('./notebook');
+const validate = require('./validate');
 const { log } = require('./log');
 
 const MAX_BODY = 1024 * 1024;
@@ -36,8 +37,9 @@ function defaultInfoDir() {
  * Requests must carry the token written to ~/.ai-notebook-live/bridge.json.
  */
 class Bridge {
-  constructor({ resolveNotebook, decideRun, infoDir }) {
+  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks }) {
     this.resolveNotebook = resolveNotebook;
+    this.listNotebooks = listNotebooks;
     // Asks the shared execution policy. A bridge caller can decline execution
     // but can never demand it - that escalation was the whole bug.
     this.decideRun = decideRun || (async () => ({ run: false, reason: 'no policy configured' }));
@@ -219,12 +221,18 @@ class Bridge {
 
     if (url.pathname === '/cell') {
       const body = await readJson(req);
+      // The body supplies content and nothing else. It used to be spread into
+      // the options bag, so any key a caller invented became an option - and
+      // body keys beat the query string. Options come from the URL, which is
+      // also what the README has always documented.
       const code = typeof body.code === 'string' ? body.code : body.text;
-      if (typeof code !== 'string') return send(res, 400, { error: 'body needs a "code" string' });
-      const writer = await this.openWriter({ ...body, search: url.searchParams });
+      if (typeof code !== 'string') {
+        return send(res, 400, { error: 'body needs a "code" string' });
+      }
+      const writer = await this.openWriter({ search: url.searchParams });
       try {
         writer.write(code);
-        return send(res, 200, await this.closeWriter(writer, { ...body, search: url.searchParams }));
+        return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
       } catch (err) {
         await writer.abandon();
         throw err;
@@ -267,25 +275,51 @@ class Bridge {
   }
 
   async openWriter(options) {
-    const notebook = this.resolveNotebook(options.notebook || options.search.get('notebook'));
-    if (!notebook) throw new BridgeError('no notebook is open in VS Code', 409);
-    const kind = options.kind || options.search.get('kind') || 'code';
-    const index = resolvePosition(
-      notebook,
-      options.position !== undefined ? options.position : options.search.get('position')
-    );
+    const hint = options.search.get('notebook');
+    const notebook = this.resolveNotebook(hint);
+    if (!notebook) {
+      // A hint that matched nothing used to fall through and write to whatever
+      // notebook happened to be active. Landing in the wrong file silently is
+      // worse than being told.
+      if (hint) {
+        const open = this.listNotebooks ? this.listNotebooks() : [];
+        throw new BridgeError(
+          `no open notebook matches ${JSON.stringify(hint)}` +
+            (open.length ? `. Open: ${open.join(', ')}` : ''),
+          409
+        );
+      }
+      throw new BridgeError('no notebook is open in VS Code', 409);
+    }
+    const kind = validate.cellKind(options.search.get('kind'));
+    const editor = editorFor(notebook);
+    const index = validate.cellPosition(options.search.get('position'), {
+      cellCount: notebook.cellCount,
+      below: editor ? editor.selection.end : notebook.cellCount,
+      above: editor ? editor.selection.start : 0,
+    });
     return CellWriter.insert(notebook, index, {
-      kind: kind === 'markdown' || kind === 'markup' ? 'markdown' : 'code',
-      language: options.language || options.search.get('language') || undefined,
-      fenced: true,
+      kind,
+      language: validate.cellLanguage(options.search.get('language')),
+      // Markdown cells keep their fenced code blocks, exactly as the explain
+      // command already did. Only this path got it wrong.
+      fenced: kind !== 'markdown',
     });
   }
 
   async closeWriter(writer, options) {
-    const raw = options.run !== undefined ? options.run : options.search.get('run');
+    // Query string only, like every other option. Reading a body key here was
+    // the last way a caller-invented field could influence execution.
+    const raw = options.search.get('run');
     // undefined means "no opinion", which lets the user's setting decide.
     // An explicit false is honoured; an explicit true is only a request.
-    const requested = raw === undefined || raw === null ? undefined : truthy(raw);
+    const requested = raw === undefined || raw === null ? undefined : validate.boolish(raw);
+    // Nothing usable arrived: take the cell back out rather than leaving an
+    // empty one behind. pump() has always done this; the bridge did not.
+    if (!writer.produced()) {
+      await writer.abandon();
+      throw new BridgeError('nothing to insert: the body produced no content', 400);
+    }
     const text = await writer.end();
     const decision = await this.decideRun({
       requested,
@@ -312,26 +346,6 @@ class Bridge {
   }
 }
 
-function truthy(value) {
-  if (typeof value === 'boolean') return value;
-  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
-}
-
-function resolvePosition(notebook, position) {
-  if (position === undefined || position === null || position === '' || position === 'below') {
-    const editor = editorFor(notebook);
-    return editor ? editor.selection.end : notebook.cellCount;
-  }
-  if (position === 'end') return notebook.cellCount;
-  if (position === 'above') {
-    const editor = editorFor(notebook);
-    return editor ? editor.selection.start : 0;
-  }
-  const index = Number(position);
-  if (Number.isNaN(index)) return notebook.cellCount;
-  return Math.max(0, Math.min(index, notebook.cellCount));
-}
-
 function send(res, status, body) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -349,11 +363,19 @@ async function readJson(req) {
     if (body.length > MAX_BODY) throw new BridgeError('body too large', 413);
   }
   if (!body.trim()) return {};
+  let parsed;
   try {
-    return JSON.parse(body);
+    parsed = JSON.parse(body);
   } catch {
     throw new BridgeError('body is not valid JSON', 400);
   }
+  // A body of `null` used to reach `body.code` and throw a TypeError that
+  // surfaced as a 500 with an internal message in it. Arrays and scalars parsed
+  // fine and then failed confusingly further along.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new BridgeError('body must be a JSON object', 400);
+  }
+  return parsed;
 }
 
 module.exports = { Bridge, BridgeError, defaultInfoDir };

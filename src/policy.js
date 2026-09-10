@@ -1,6 +1,7 @@
 'use strict';
 const vscode = require('vscode');
 const { log } = require('./log');
+const validate = require('./validate');
 
 /**
  * The single gate on executing a notebook cell.
@@ -59,11 +60,20 @@ async function decideExecution({
   intent,
   requested,
   preview,
-  opts,
+  opts = {},
   blocking = true,
   onLateApproval,
 }) {
-  if (!preview || !preview.trim()) return { run: false, reason: 'there is nothing to run' };
+  // Coerced, not assumed. This function promises never to throw, and a throw
+  // here propagates out of the bridge's HTTP handler.
+  const code = typeof preview === 'string' ? preview : String(preview == null ? '' : preview);
+  if (!code.trim()) return { run: false, reason: 'there is nothing to run' };
+
+  // An unrecognised caller must not inherit a permissive setting. LABEL is
+  // already the list of surfaces we know about, so it is also the allow-list.
+  if (!Object.prototype.hasOwnProperty.call(LABEL, intent)) {
+    return { run: false, reason: 'unrecognised caller' };
+  }
 
   // Restricted Mode means the user has said they do not trust this folder.
   // Running model-written code in it is exactly what they declined.
@@ -74,7 +84,14 @@ async function decideExecution({
   // A caller may always decline execution; it may never demand it.
   if (requested === false) return { run: false, reason: 'the caller asked for it not to run' };
 
-  const mode = intent === 'bridge' ? opts.bridgeExecution : opts.execution;
+  // Anything that is not exactly one of the three known modes means never, so a
+  // typo in settings.json ("alway") fails closed instead of falling through to
+  // the ask path.
+  const mode = validate.oneOf(
+    intent === 'bridge' ? opts.bridgeExecution : opts.execution,
+    ['never', 'ask', 'always'],
+    'never'
+  );
   if (mode === 'never') {
     return {
       run: false,
@@ -94,10 +111,10 @@ async function decideExecution({
   if (!blocking) {
     // The bridge is holding a socket open, so never make an HTTP client wait on
     // a human. Answer now, prompt afterwards, run it if the answer is yes.
-    askLater(intent, preview, onLateApproval);
+    askLater(intent, code, onLateApproval);
     return { run: false, pending: true, reason: 'waiting for your approval in VS Code' };
   }
-  return askNow(intent, preview);
+  return askNow(intent, code);
 }
 
 function promptFor(intent, preview) {
