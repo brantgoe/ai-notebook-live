@@ -1399,6 +1399,119 @@ test('a generation the user did not touch still runs when they asked for that', 
   });
 });
 
+test('a finished generation leaves no timer armed to kill the next one', async () => {
+  // The idle timer was cleared only in the catch, so every SUCCESSFUL
+  // generation left one armed for the whole silence window - default 300s.
+  // Measured by a reviewer: five generations, five live timers, and one of them
+  // cancelled a healthy stream 30 seconds later, which the user was then told
+  // was their own cancellation. Each also pinned the writer, and through it the
+  // notebook document.
+  //
+  // Asserted structurally rather than by waiting: the floor on timeoutSeconds is
+  // 30s, so the failure itself is not something a test can sit through.
+  await withFakeClaude('ok', async (binary) => {
+    const extension = require(path.join('..', 'extension.js'));
+    const notebook = newNotebook(['answer = 42']);
+    const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+    vscode.window.visibleNotebookEditors.push(editor);
+    vscode.window.activeNotebookEditor = editor;
+    vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+    vscode.__test.config.set('aiNotebookLive.claudePath', binary);
+    vscode.__test.config.set('aiNotebookLive.execution', 'never');
+
+    const context = {
+      subscriptions: [],
+      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    };
+    extension.activate(context);
+    const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+    try {
+      const before = timers();
+      for (let i = 0; i < 3; i += 1) {
+        vscode.__test.inputs.push('simplify it');
+        await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+      }
+      // Not strict equality: this counts every timer in the process, and an
+      // unrelated one expiring mid-test would make the count fall. A leak only
+      // ever adds - three generations leaked three - so "no net increase" is
+      // both robust to that and still fails loudly on the bug.
+      const after = timers();
+      assert.ok(
+        after <= before,
+        `three completed generations must leave no timer armed (was ${before}, now ${after})`
+      );
+    } finally {
+      vscode.window.activeNotebookEditor = undefined;
+      await extension.deactivate();
+    }
+  });
+});
+
+test('the bridge does not start in a folder the user has not trusted', async () => {
+  // package.json tells the user, in the Restricted Mode dialog itself, that
+  // "the agent bridge does not start" in an untrusted folder. Nothing enforced
+  // it: isTrusted appeared exactly once in the whole extension, gating
+  // execution. Execution being blocked made this content injection rather than
+  // RCE, but a security property stated in a trust dialog has to be real.
+  const extension = require(path.join('..', 'extension.js'));
+  newNotebook(['x = 1']);
+  const trusted = vscode.workspace.isTrusted;
+  vscode.workspace.isTrusted = false;
+  vscode.__test.config.set('aiNotebookLive.bridge.port', 0);
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  extension.activate(context);
+  try {
+    await vscode.__test.commands.get('aiNotebookLive.startBridge')();
+    const warned = vscode.__test.shown.filter((e) => /not trusted/.test(e.message || ''));
+    assert.strictEqual(warned.length, 1, 'and the user is told why');
+    // Now trust it, and the same command works - or the guard is just breakage.
+    vscode.workspace.isTrusted = true;
+    await vscode.__test.commands.get('aiNotebookLive.startBridge')();
+  } finally {
+    vscode.workspace.isTrusted = trusted;
+    await extension.deactivate();
+  }
+});
+
+test('deactivate cancels a generation instead of orphaning its process', async () => {
+  // deactivate() forgot session grants, stopped the bridge and disposed the log
+  // - and never touched state.active. A window reload mid-generation left the
+  // `claude` child reparented to init, still burning the user's plan quota,
+  // with no window left that could cancel it.
+  const extension = require(path.join('..', 'extension.js'));
+  newNotebook(['x = 1']);
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  extension.activate(context);
+  let cancelled = false;
+  // Stand in for a generation in flight.
+  const cts = new vscode.CancellationTokenSource();
+  cts.token.onCancellationRequested(() => {
+    cancelled = true;
+  });
+  extension.__test.setActive(cts);
+  await extension.deactivate();
+  assert.ok(cancelled, 'the in-flight generation must be cancelled on the way out');
+});
+
+test('a claudePath pointing at a directory is not mistaken for the CLI', async () => {
+  // On POSIX the execute bit on a directory means "search", so accessSync(X_OK)
+  // accepted ~/.local/bin as though it were the binary. locateClaude reported
+  // found:true, the control panel showed a healthy provider, and the failure
+  // surfaced as a raw `spawn EACCES` only after the cell had been created.
+  if (process.platform === 'win32') skip('POSIX permission semantics');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-dir-'));
+  providerCli.invalidateCliCache();
+  const found = providerCli.locateClaude(dir);
+  assert.ok(!found.found || found.binary !== dir, 'a directory is not an executable');
+  providerCli.invalidateCliCache();
+});
+
 test('a hung CLI is given up on instead of wedging the extension', async () => {
   // stream() never settling meant guard()'s finally never ran, state.active was
   // never cleared, and EVERY later command was refused for the life of the

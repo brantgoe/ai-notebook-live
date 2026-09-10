@@ -41,6 +41,10 @@ async function storedApiKey(secrets) {
 // The PATH scan stats every directory on PATH, so it is cached - but on a TTL,
 // not forever: someone who is told to install the CLI must not have to reload
 // the window afterwards.
+/** A single stdout line longer than this is a runaway, not a cell. */
+const MAX_LINE = 8 * 1024 * 1024;
+/** Only the last lines of stderr are ever reported to the user. */
+const MAX_STDERR = 64 * 1024;
 const CLI_TTL_MS = 30_000;
 let cliCache = { at: 0, hint: null, found: false, binary: undefined, source: 'none' };
 
@@ -76,6 +80,11 @@ function locateClaude(explicit) {
   let source = 'none';
   for (const [candidate, why] of candidatePaths(explicit)) {
     try {
+      // isFile first: on POSIX the execute bit on a DIRECTORY means "search",
+      // so accessSync(X_OK) happily accepted ~/.local/bin. The control panel
+      // then reported a healthy provider and the failure surfaced as a raw
+      // `spawn EACCES` only after the cell had already been created.
+      if (!fs.statSync(candidate).isFile()) throw new Error('not a file');
       fs.accessSync(candidate, fs.constants.X_OK);
       found = true;
       binary = candidate;
@@ -343,10 +352,33 @@ function streamCli({ system, user, opts, token, onText, binary }) {
         buffer = buffer.slice(nl + 1);
         if (line) handle(line);
       }
+      // A single line longer than this is not a cell, it is a runaway - a
+      // claudePath pointing at the wrong binary, or a wrapper teeing a verbose
+      // log. Left unbounded the string grows to MAX_STRING_LENGTH (~537MB here)
+      // and then throws RangeError INSIDE a stream handler, which is an
+      // uncaught exception in the extension host: every extension in the window
+      // goes down. Long before that a classroom laptop is swapping.
+      if (buffer.length > MAX_LINE) {
+        buffer = '';
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+        reject(
+          new ProviderError(
+            'The `claude` CLI produced far more output than a cell can hold, so it was stopped. ' +
+              'Check aiNotebookLive.claudePath points at the real CLI.'
+          )
+        );
+      }
     });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
+      // Only the last couple of lines are ever shown, so keeping megabytes of
+      // it serves nobody.
+      if (stderr.length > MAX_STDERR) stderr = stderr.slice(-MAX_STDERR);
     });
 
     child.on('error', (err) => {
@@ -364,7 +396,18 @@ function streamCli({ system, user, opts, token, onText, binary }) {
           : err
       );
     });
-    child.on('close', (code) => {
+    // 'exit' rather than 'close'. Node emits 'close' only once the child has
+    // exited AND its stdio has closed, and a grandchild holding the inherited
+    // stdout pipe keeps it open indefinitely - measured: exit fired at 302ms,
+    // close never fired at all, even after SIGKILL. stream() then never settled,
+    // guard()'s finally never ran, and every later command was refused for the
+    // life of the window. That is the exact wedge the idle timer exists to
+    // prevent, and the timer cannot help: all it does is cancel, which is what
+    // already failed.
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return undefined;
+      settled = true;
       if (escalate) clearTimeout(escalate);
       if (cancel) cancel.dispose();
       if (buffer.trim()) handle(buffer.trim());
@@ -389,8 +432,12 @@ function streamCli({ system, user, opts, token, onText, binary }) {
           new ProviderError(`The \`claude\` CLI produced no output. ${said.split('\n').slice(-2).join(' ')}`.trim())
         );
       }
-      resolve({ provider: 'claude-cli', model, stopReason: 'end_turn' });
-    });
+      return resolve({ provider: 'claude-cli', model, stopReason: 'end_turn' });
+    };
+    child.on('exit', finish);
+    // Still listened for, because it carries any last buffered stdout when it
+    // does arrive first; whichever comes first wins and the other is ignored.
+    child.on('close', finish);
 
     // The prompt carries the whole notebook context, so this write is often
     // still queued in the pipe buffer when the child goes away - on cancel, or
@@ -412,4 +459,6 @@ module.exports = {
   storedApiKey,
   invalidateSecretCache,
   invalidateCliCache,
+  // Exported for the test that pins "a directory is not an executable".
+  locateClaude,
 };

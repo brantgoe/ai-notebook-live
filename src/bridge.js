@@ -69,8 +69,22 @@ class Bridge {
 
   async start(port) {
     if (this.running) return { port: this.port, token: this.token };
+    // `running` only becomes true once listen() completes, so two overlapping
+    // starts - autoStart racing a manual one, or a double-click on the control
+    // panel row - each overwrote the other's token and server, and the first
+    // one's callback then read the SECOND server's address while it was still
+    // binding. The first server stayed listening on the port, unreachable, for
+    // the life of the window.
+    if (this.starting) return this.starting;
+    this.starting = this.begin(port).finally(() => {
+      this.starting = undefined;
+    });
+    return this.starting;
+  }
+
+  async begin(port) {
     this.token = crypto.randomBytes(18).toString('hex');
-    this.server = http.createServer((req, res) => {
+    const server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
         log('bridge error:', err && err.message);
         send(res, (err && err.status) || 500, { error: String((err && err.message) || err) });
@@ -78,15 +92,35 @@ class Bridge {
     });
 
     await new Promise((resolve, reject) => {
-      this.server.once('error', reject);
+      server.once('error', reject);
       // Loopback only - never expose notebook writes to the network.
-      this.server.listen(port, '127.0.0.1', () => {
-        this.server.removeListener('error', reject);
+      server.listen(port, '127.0.0.1', () => {
+        server.removeListener('error', reject);
         resolve();
       });
     });
-    this.port = this.server.address().port;
-    this.writeInfo();
+    // Bound to a local until it is actually listening, so a concurrent start
+    // cannot swap it out from under this one.
+    this.server = server;
+    this.port = server.address().port;
+    // Nothing keeps an 'error' listener on a live server, and Node emits one
+    // for accept-time failures such as EMFILE. An unhandled 'error' on an
+    // EventEmitter throws, and here that would take down the whole extension
+    // host - every extension in the window, not just this one.
+    server.on('error', (err) => log('bridge server error:', (err && err.message) || err));
+    try {
+      this.writeInfo();
+    } catch (err) {
+      // A bridge nobody can find is not a bridge. This used to be swallowed and
+      // the next line announced success anyway, leaving the user in a loop: VS
+      // Code says it is running, every client says it is not, and running the
+      // start command again just repeats both.
+      await this.stop();
+      throw new Error(
+        `the bridge started but could not publish its token to ${this.infoFile}: ` +
+          `${(err && err.message) || err}`
+      );
+    }
     log(`bridge listening on http://127.0.0.1:${this.port}`);
     return { port: this.port, token: this.token };
   }
@@ -149,6 +183,7 @@ class Bridge {
       this.writeExclusive(this.infoFile, payload);
     } catch (err) {
       log('could not write bridge info file:', err && err.message);
+      throw err;
     }
   }
 
