@@ -83,6 +83,36 @@ release is what came out of it. Nothing new was added; a lot was made true.
 - An `ANTHROPIC_API_KEY` left in your shell silently switches you to paid
   billing; the README says so now.
 
+### Fixed — talking to other tools
+
+- **A malformed line got no answer at all**, so an MCP client with a request
+  outstanding waited forever. Batch requests vanished the same way. Both are
+  answered now, and an unknown method returns `-32601` rather than a generic
+  server error — which is how a client tells "I do not do that" from "I broke".
+- **Calling a tool that does not exist reported "the bridge is not running."**
+  The name was checked only after contacting VS Code, so a typo looked like a
+  configuration problem.
+- **Queued responses were lost when the input stream closed** — measured, 24 of
+  40 with a slow reader — because `process.exit` does not flush a pending write.
+- `/health` now reports the extension version and which verbs it supports. There
+  was no way to tell an old bridge from a broken one.
+- An unknown path is a `404`; a `405` now means the method was wrong for a path
+  that does exist.
+
+### Security and supply chain
+
+- `SECURITY.md`: where to report a problem, what this extension can actually do,
+  and how to check that a downloaded `.vsix` holds the code this repo built.
+- Releases publish `SHA256SUMS`, including the hash of the bundled
+  `extension.js` — the `.vsix` zip is not byte-reproducible, but its contents
+  are.
+- CI actions are pinned to commit SHAs rather than mutable tags, and the
+  workflow defaults to `contents: read`.
+- `standardwebhooks` ships no license file, so the notices carried a link rather
+  than a notice; MIT requires the text itself to travel. It is embedded now,
+  along with the discrepancy found while checking: the package declares MIT
+  while its repository publishes Apache-2.0.
+
 ### Added
 
 - `expect=` on `/cell/replace`: the source you believe you are replacing. The
