@@ -80,6 +80,93 @@ test('unfence emits nothing while an opening fence is still arriving', () => {
   }
 });
 
+/**
+ * Every token here exists because of a specific bug. Do not prune this list to
+ * make the fuzzer faster - the alphabet is the asset, the string count is not.
+ */
+const FENCE_TOKENS = [
+  '`', //          a lone backtick: R quotes identifiers with these
+  '``', //         two backticks: still not a fence
+  '```', //        the fence itself
+  '````', //       a longer fence, which CommonMark lets close a shorter one
+  '```python', //  a fence with an info string
+  '``` ', //       trailing whitespace after a marker still closes a fence
+  '"""', //        a Python docstring, which may legally contain a fence
+  '\n',
+  '\r\n', //       CRLF: stripping the stray \r would be a retraction
+  '\r', //         a bare CR on its own
+  'a',
+  'print(1)',
+  '~~~', //        tilde fences exist in markdown but are not handled
+];
+
+/** Seeded so a failure is reproducible from the printed seed, unlike Math.random. */
+function lcg(seed) {
+  let state = seed;
+  return () => {
+    state = (state * 1103515245 + 12345) & 0x7fffffff;
+    return state / 0x7fffffff;
+  };
+}
+
+function fuzzStrings(seed, count) {
+  const rnd = lcg(seed);
+  const out = [];
+  for (let n = 0; n < count; n += 1) {
+    let s = '';
+    const parts = 1 + Math.floor(rnd() * 6);
+    for (let i = 0; i < parts; i += 1) s += FENCE_TOKENS[Math.floor(rnd() * FENCE_TOKENS.length)];
+    out.push(s);
+  }
+  return out;
+}
+
+test('unfence never retracts text it has already emitted', () => {
+  // The contract that matters most in this file. setText is a full reconcile,
+  // not an append, so text that is emitted and later withdrawn is DELETED from
+  // a cell the user can already see.
+  for (const seed of [1, 20260909, 777771, 424242]) {
+    for (const raw of fuzzStrings(seed, 12500)) {
+      const whole = unfence(raw);
+      for (let i = 1; i <= raw.length; i += 1) {
+        const partial = unfence(raw.slice(0, i));
+        assert.ok(
+          whole.startsWith(partial),
+          `seed ${seed}: ${JSON.stringify(raw)} at prefix ${i} emitted ` +
+            `${JSON.stringify(partial)}, which is not a prefix of ${JSON.stringify(whole)}`
+        );
+      }
+    }
+  }
+});
+
+/**
+ * Today's answer for every fence shape we have actually seen, including the ones
+ * that are wrong. Rows marked LOSSY are bugs (qa/BUGS.md P2-1) - when they are
+ * fixed, the diff of this table is the bug report.
+ */
+const FENCE_SHAPES = [
+  ['plain fenced block', '```python\nprint(1)\n```', 'print(1)'],
+  ['no fence at all', 'print(1)\n', 'print(1)\n'],
+  ['fence inside a markdown body', 'text\n```python\nx=1\n```', 'text\n```python\nx=1\n```'],
+  ['prose before a fence', 'Here is the code:\n```python\nx=1\n```', 'Here is the code:\n```python\nx=1\n```'],
+  ['LOSSY fence inside a docstring', '```python\ns = """\n```\nstill\n"""\n```', 's = """'],
+  ['LOSSY backtick-quoted R name', '`my var` <- 5', ''],
+  ['LOSSY inline code only', '`x`', ''],
+  ['LOSSY nested fences', '````markdown\n```python\nprint(1)\n```\n````', ''],
+  ['empty fence pair', '```\n```', ''],
+  ['unterminated fence', '```python\nprint(1)\nprint(2)', 'print(1)\nprint(2)'],
+  ['trailing prose after a fence', '```python\nprint(1)\n```\nand prose', 'print(1)'],
+  ['two separate blocks', '```python\nA\n```\n```python\nB\n```', 'A'],
+  ['CRLF line endings', '```python\r\nprint(1)\r\n```', 'print(1)\r'],
+];
+
+test('unfence handles every fence shape we have actually seen', () => {
+  for (const [name, raw, expected] of FENCE_SHAPES) {
+    assert.strictEqual(unfence(raw), expected, `${name}: ${JSON.stringify(raw)}`);
+  }
+});
+
 /* ------------------------------ CellWriter ------------------------------ */
 
 test('insert streams chunks into a new cell and strips fences', async () => {
