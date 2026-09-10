@@ -1,127 +1,214 @@
 # AI Notebook Live
 
-Streams AI-generated code into Jupyter notebook cells **as it is written**, and opens a
-loopback bridge so other AI agents (Claude Code, scripts, cron jobs) can drop cells into
-the notebook you have open right now.
+**Claude writes, fixes and explains Jupyter cells in place — using your existing
+Claude Code login, no API key required.**
 
-Nothing is pasted in after the fact: a cell is created empty and fills in token by token,
-so you watch the code appear and can stop it mid-sentence.
+The code appears in the cell, token by token, in the notebook you already have
+open. Not in a side panel you copy out of, and not on disk behind a stale tab.
+
+There is also a localhost bridge, so other AI tools on your machine can add
+cells to the open notebook. That is off by default.
+
+> Not affiliated with, endorsed by, or sponsored by Anthropic.
+> Claude is a trademark of Anthropic, PBC.
+
+## Why this rather than the alternatives
+
+Most notebook AI tools either need an API key with billing attached, or write to
+the `.ipynb` on disk — which does **not** show up in a notebook tab you already
+have open, and gets overwritten the moment you save. Editing the live document
+needs VS Code's `NotebookEdit` API, which is what this extension uses.
+
+- **No API key needed.** If you have Claude Code installed and logged in, that
+  is enough. A key is supported if you prefer one.
+- **It reads your errors.** *Fix the Error* sends the cell and its traceback, so
+  you do not have to explain what went wrong.
+- **It writes where you are.** The notebook stays the artifact, and undo works.
 
 ## Install
 
-```bash
-cd ai-notebook-live
-npm install                 # one dependency: @anthropic-ai/sdk
-npm test                    # 18 tests, no VS Code needed
-npx @vscode/vsce package    # -> ai-notebook-live-0.1.0.vsix
-code --install-extension ai-notebook-live-0.1.0.vsix
-```
+1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
+2. ```bash
+   code --install-extension ai-notebook-live-0.2.0.vsix
+   ```
+3. Reload the window.
 
-Then reload VS Code (**Developer: Reload Window**). Development alternative: copy or symlink
-this folder into `~/.vscode/extensions/` and reload.
+You also need the **Jupyter** extension and a Python kernel to *run* cells;
+without them the extension still writes cells, it just cannot execute them.
 
-## Where the code comes from
+### Updating
 
-Two providers, picked by `aiNotebookLive.provider` (default `auto`):
+Installs are manual, so nothing will prompt you. Grab the newer `.vsix` from
+Releases and run the same command — `--force` if it complains — then reload.
+[CHANGELOG.md](CHANGELOG.md) says whether it is worth it.
 
-| Provider | Needs | Notes |
+## Setup
+
+Open the **control panel** — `Ctrl+Shift+P` → `AI Notebook: Control Panel`, or
+click the `$(sparkle) AI` item in the status bar. It tells you which provider it
+found and what will happen when a cell finishes.
+
+Two ways to reach a model:
+
+| | How | Cost |
 |---|---|---|
-| `api` | An Anthropic API key | Run **AI Notebook: Set Anthropic API Key** (stored in the VS Code secret store, never in `settings.json`). Also reads `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Streams over the official SDK with `output_config.effort` and server-side refusal fallbacks. |
-| `claude-cli` | The `claude` CLI on PATH | Uses your existing Claude Code login — **no API key needed**. Runs `claude --print --output-format stream-json --include-partial-messages`. |
+| **Claude Code CLI** *(default)* | Install [Claude Code](https://claude.com/claude-code) and log in | Uses your existing plan |
+| **Anthropic API** | `AI Notebook: Set Anthropic API Key` | Billed per token |
 
-`auto` uses the API when a key is available and the CLI otherwise.
+With `provider` on `auto` a stored key wins; otherwise the CLI is used. If the
+`claude` command is somewhere unusual, set `aiNotebookLive.claudePath` — the
+error message offers to do it for you.
 
 ## Commands
 
-| Command | Keybinding | What it does |
+| Command | Key | What it does |
 |---|---|---|
-| AI Notebook: Generate Cell with AI… | `Ctrl+Alt+G` | Asks what you want, inserts a cell below the selected one, streams the code in |
-| AI Notebook: Revise This Cell… | `Ctrl+Alt+R` | Rewrites the selected cell in place from your instruction (`Ctrl+Z` restores it) |
-| AI Notebook: Fix the Error in This Cell | `Ctrl+Alt+F` | Reads the cell's traceback, rewrites the cell, and runs it |
-| AI Notebook: Explain This Cell | — | Streams a markdown explanation cell in directly above |
-| AI Notebook: Cancel AI Generation | — | Also on the status-bar item while it is writing |
-| AI Notebook: Start/Stop Local Agent Bridge | — | See below |
+| Generate Cell with AI… | `Ctrl+Alt+G` | Describe a cell; it is written below the selection |
+| Revise This Cell with AI… | `Ctrl+Alt+R` | Rewrites the selected cell from your instruction |
+| Fix the Error in This Cell | — | Sends the cell and its traceback, and rewrites it |
+| Explain This Cell | — | Adds a markdown explanation *above* the cell |
+| Control Panel | — | Provider, execution policy, bridge state |
+| Cancel AI Generation | — | Stops the current stream, keeping what arrived |
+| Set / Clear Anthropic API Key | — | Stored in VS Code's secret store, never in `settings.json` |
+| Start / Stop Local Agent Bridge | — | The localhost endpoint for other tools |
+| Copy Agent Bridge Example Command | — | A ready-to-run command, with no token in it |
+| Show Log | — | What was sent where, and why a cell did or did not run |
 
-Every generation sees the preceding cells **and their outputs and errors**, so it reuses the
-variables and imports you already have instead of inventing new ones.
+*Revise*, *Fix* and *Explain* are also on the cell toolbar.
 
-## Letting other agents write into the notebook
+## Whether generated code runs
 
-Run **AI Notebook: Start Local Agent Bridge**. It listens on `127.0.0.1` only, requires a
-token, and writes that token to `~/.ai-notebook-live/bridge.json` (mode 600).
+Writing a cell and running a cell are separate decisions, and you own the second
+one. Set it in the control panel, or directly:
 
-```bash
-# one-shot cell
-curl -sS -X POST "http://127.0.0.1:37417/cell?run=1" \
-  -H "x-ai-notebook-token: $(jq -r .token ~/.ai-notebook-live/bridge.json)" \
-  -d '{"code":"print(\"hello from an agent\")"}'
-
-# stream a generator straight into a cell, live
-claude -p 'write a pandas groupby example' | node bin/nbpush.js --run
-```
-
-`bin/nbpush.js` is a small client for the same bridge:
-
-```
-nbpush [--code TEXT | --file PATH | -]   # default: read stdin, streaming
-       [--markdown] [--run | --no-run]
-       [--position below|above|end|<index>]
-       [--notebook <path substring>] [--health]
-```
-
-Endpoints (all require the token header, `POST` unless noted):
-
-| Endpoint | Body | Result |
+| Setting | Default | Applies to |
 |---|---|---|
-| `GET /health` | — | `{ok, notebook, cells}` |
-| `/cell` | `{"code": "...", "kind": "code\|markdown", "position": …, "run": …}` | inserts one cell |
-| `/cell/stream` | raw text, streamed | appends each chunk to the cell as it arrives |
+| `aiNotebookLive.execution` | `ask` | Cells **you** asked Claude for |
+| `aiNotebookLive.bridge.execution` | `never` | Cells **another program** pushed in |
 
-Query parameters (`?kind=&position=&run=&notebook=`) work in place of JSON fields.
+Each is `never`, `ask` or `always`. `ask` shows the code and waits for you.
 
-### Using it from Claude Code
+An agent using the bridge may ask for its cell to be run, but cannot demand it:
+a request can only ever lower this decision, never raise it. Nothing executes in
+a workspace you have not trusted.
 
-Point Claude Code at the bridge and it can write cells into your open notebook itself:
-
-> Read `~/.ai-notebook-live/bridge.json`, then POST a cell to `/cell?run=1` that plots the
-> price column from the dataframe in my notebook.
+If you previously used `aiNotebookLive.autoRun`, it still works — `true` behaves
+as `always`, `false` as `never`. Bridge execution is deliberately not inherited
+from it; turn that on yourself if you want it.
 
 ## Settings
 
-| Setting | Default | Meaning |
+| Setting | Default | Notes |
 |---|---|---|
-| `aiNotebookLive.provider` | `auto` | `auto`, `api`, or `claude-cli` |
-| `aiNotebookLive.model` | `claude-opus-5` | Any current model id |
-| `aiNotebookLive.effort` | `medium` | `low`→`max`; raise it for harder cells, lower it for speed |
-| `aiNotebookLive.maxTokens` | `8000` | Output cap per cell |
-| `aiNotebookLive.contextCells` | `12` | Preceding cells sent as context (`-1` = whole notebook) |
-| `aiNotebookLive.includeOutputs` | `true` | Send cell outputs and errors too |
-| `aiNotebookLive.autoRun` | `false` | Execute a generated code cell when streaming finishes |
-| `aiNotebookLive.systemPromptExtra` | `""` | House style, e.g. *"Beginner class: comment every line."* |
-| `aiNotebookLive.refusalFallback` | `true` | Server-side refusal fallbacks on the API provider |
-| `aiNotebookLive.bridge.autoStart` | `false` | Start the bridge when a notebook opens |
-| `aiNotebookLive.bridge.port` | `37417` | `0` picks a free port |
+| `provider` | `auto` | `auto`, `api`, or `claude-cli` |
+| `claudePath` | — | Absolute path to `claude`, if it is not found |
+| `model` | `claude-opus-5` | Try `claude-sonnet-5` for faster, cheaper cells |
+| `effort` | `medium` | Reasoning effort. API provider only |
+| `maxTokens` | `8000` | Per cell. API provider only |
+| `contextCells` | `12` | Preceding cells sent as context; `-1` for all |
+| `includeOutputs` | `true` | Send cell outputs and tracebacks too — see [Privacy](#privacy) |
+| `execution` | `ask` | Whether generated code runs |
+| `systemPromptExtra` | — | House style, e.g. *"Beginner class: keep code simple and comment every line"* |
+| `refusalFallback` | `true` | Retry a declined request on a fallback model |
+| `bridge.execution` | `never` | Whether agent-pushed code runs |
+| `bridge.autoStart` | `false` | Start the bridge when a notebook opens |
+| `bridge.port` | `37417` | `0` picks a free port |
 
-## How it works
+`systemPromptExtra` is settable per-workspace, so a class or team folder can
+carry its own house style. It is ignored in a workspace you have not trusted.
+Settings that decide execution or open a socket can only be set per-machine, so
+a repository you clone cannot change them.
 
-- A cell is inserted empty, then every flush (60 ms) reconciles the cell document with the
-  text received so far, rewriting only the tail that changed — so the editor is not
-  re-rendered per token and the undo stack stays usable.
-- The cell is re-resolved from its document URI before each flush, so it keeps writing to
-  the right cell even if you add or delete cells above it mid-stream.
-- Models sometimes wrap answers in ``` fences. Stripping them from a *partial* response has
-  to be prefix-stable — text already shown must never be retracted — which is what
-  `unfence()` and its tests guarantee.
-- Cancelling keeps whatever was written; an empty result removes the cell again.
+## The agent bridge
+
+`AI Notebook: Start Local Agent Bridge` opens a token-authenticated HTTP
+endpoint on `127.0.0.1` so other tools can add cells to the open notebook.
+
+```bash
+# Anything on the machine that can read the token file:
+printf 'print("hello from an agent")' | node bin/nbpush.js
+```
+
+`nbpush` lives inside the installed extension. `Copy Agent Bridge Example
+Command` gives you a working command for your machine.
+
+```
+GET  /health        state of the target notebook
+POST /cell          {"code": "..."} in one shot
+POST /cell/stream   raw body, streamed into the cell as it arrives
+```
+
+Query parameters: `kind=markdown`, `position=below|above|end|<index>`,
+`run=0|1`, `notebook=<path fragment>`.
+
+### Security
+
+- **Loopback only.** The listener binds `127.0.0.1` and is never exposed.
+- **Token in a header**, `x-ai-notebook-token`, never in the URL. That is
+  deliberate: a header forces browsers to preflight the request, which this
+  server refuses, so a web page cannot reach the bridge. A token in a query
+  string would remove that protection and would land in shell history.
+- Requests carrying an `Origin`, or a `Host` that is not loopback, are refused.
+- The token file is created `0600` in a `0700` directory, with `O_EXCL` so it
+  will not follow a symlink.
+- Copyable commands never contain the token.
+- Execution goes through the policy above, and never happens in an untrusted
+  workspace.
+
+**What it still means:** while the bridge is running, any program on your
+machine that can read `~/.ai-notebook-live/` can add cells to your notebook —
+and run them, if you have set `bridge.execution` to allow it. That is the point
+of the feature, and it is why it is off by default. On Windows the file modes
+above are not meaningfully enforced by the OS.
+
+## Privacy
+
+To generate a cell, this extension sends to your chosen provider:
+
+- the **cells before the insertion point** (`contextCells`, 12 by default),
+- their **outputs and error tracebacks**, if `includeOutputs` is on — which it
+  is by default,
+- the notebook's **file name only**, never its path,
+- the kernel language, and your instruction.
+
+Cell outputs routinely contain more than people expect: dataframe contents, file
+paths, API responses, and anything you have printed. The default is on because
+it is what makes the tool good — the model reuses your real column names instead
+of inventing them, and *Fix the Error* depends on it — but you can turn it off
+in the control panel or with `includeOutputs`.
+
+With the **API** provider this goes to Anthropic under your API key. With the
+**Claude Code CLI** provider it goes through your existing Claude Code session.
+
+**This extension collects no telemetry of its own.** Nothing is sent anywhere
+except the provider you chose, for a request you triggered.
 
 ## Limitations
 
-- One generation at a time (the status bar shows it; click to cancel).
-- Typing in a cell while it is being written fights the stream — let it finish.
-- Requires the Jupyter extension for execution (`autoRun`, *Fix the Error*).
+- Writes into the notebook **currently open in VS Code**. It does not edit files
+  on disk, and cannot help with a notebook that is closed.
+- Running cells needs the Jupyter extension and a live kernel.
+- `maxTokens`, `effort` and `refusalFallback` apply to the API provider only.
+- On models with extended thinking there can be a pause before any text appears;
+  the status bar shows a spinner while it works.
+- Undo granularity follows the stream: `Ctrl+Z` steps back through it rather
+  than reverting a whole generation in one go. If a revision *fails*, your
+  original is restored in a single step.
 
 ## Development
 
 ```bash
-npm test     # node test/run.js — vscode API is stubbed in test/vscode-stub.js
+npm ci
+npm test          # 44 tests, no VS Code needed
+npm run build     # bundle to dist/
+npm run package   # build a .vsix
 ```
+
+`test/vscode-stub.js` stands in for the `vscode` API, which is why the suite runs
+under plain Node. `npm test` writes only to a temporary directory and will not
+disturb a bridge you have running.
+
+## Licence
+
+[Apache-2.0](LICENSE). Bundled dependency notices are in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

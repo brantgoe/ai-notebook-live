@@ -1130,6 +1130,23 @@ test('the packaged extension is small, complete and actually loadable', async ()
     }
   }
 
+  // The old README claimed "18 tests" when there were 22. A number in prose
+  // drifts; a number a test checks does not.
+  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  const claimed = readme.match(/(\d+) tests/);
+  if (claimed) {
+    assert.strictEqual(
+      Number(claimed[1]),
+      tests.length,
+      `README claims ${claimed[1]} tests but there are ${tests.length}`
+    );
+  }
+  // Nor may it point at a version that is not this one.
+  const stale = readme.match(/ai-notebook-live-(\d[\w.-]*)\.vsix/);
+  if (stale) {
+    assert.strictEqual(stale[1], manifest.version, 'README install command names a stale version');
+  }
+
   // The .vsix used to carry 2,399 files. Keep the win.
   const ignore = fs.readFileSync(path.join(root, '.vscodeignore'), 'utf8');
   assert.match(ignore, /^\*\*$/m, '.vscodeignore must be an allow-list, not a deny-list');
