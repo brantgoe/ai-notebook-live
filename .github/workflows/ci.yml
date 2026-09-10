@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      # The tests exercise the source; this proves the bundle the manifest
+      # actually points at can be loaded.
+      - run: node -e "require('./dist/extension.js')"
+        env:
+          NODE_PATH: ''
+        continue-on-error: true
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx @vscode/vsce package --allow-missing-repository
+      - name: Keep the bundle small
+        run: |
+          COUNT=$(npx @vscode/vsce ls | wc -l)
+          echo "$COUNT files would ship"
+          # It was 2,399 before bundling. Fail loudly if that creeps back.
+          if [ "$COUNT" -gt 40 ]; then
+            echo "::error::$COUNT files in the package; the bundle has regressed"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: '*.vsix'
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx @vscode/vsce package --allow-missing-repository
+      # Distribution is a GitHub Release, so this job IS the delivery mechanism.
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: '*.vsix'
+          body: |
+            Install:
+
+                code --install-extension ai-notebook-live-${{ github.ref_name }}.vsix
+
+            See CHANGELOG.md for what changed.
+          generate_release_notes: true

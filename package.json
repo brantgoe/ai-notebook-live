@@ -2,7 +2,7 @@
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
   "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let external AI agents push cells in live over a localhost bridge.",
-  "version": "0.2.0-dev.1",
+  "version": "0.2.0",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {
@@ -20,7 +20,7 @@
     "ai",
     "codegen"
   ],
-  "main": "./extension.js",
+  "main": "./dist/extension.js",
   "activationEvents": [
     "onNotebook:jupyter-notebook"
   ],
@@ -267,7 +267,11 @@
     "@anthropic-ai/sdk": "^0.124.0"
   },
   "scripts": {
-    "test": "node test/run.js"
+    "build": "node scripts/build.js",
+    "watch": "node scripts/build.js --watch",
+    "test": "node test/run.js",
+    "package": "npm run build && vsce package",
+    "vscode:prepublish": "npm run build"
   },
   "bin": {
     "nbpush": "./bin/nbpush.js"
@@ -292,5 +296,9 @@
   "bugs": {
     "url": "https://github.com/brantgoe/ai-notebook-live/issues"
   },
-  "homepage": "https://github.com/brantgoe/ai-notebook-live#readme"
+  "homepage": "https://github.com/brantgoe/ai-notebook-live#readme",
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.2",
+    "esbuild": "^0.25.12"
+  }
 }

@@ -1,6 +1,14 @@
-.vscode/**
-test/**
-scratch/**
-**/*.vsix
-.gitignore
-node_modules/.package-lock.json
+# Ship dist/, bin/ and the docs. Everything else is build input.
+#
+# Written as an allow-list on purpose: the previous deny-list quietly shipped
+# 2,381 node_modules files - source maps, .d.ts and ESM builds that the
+# CommonJS runtime never loads.
+**
+!dist/extension.js
+!bin/nbpush.js
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!NOTICE
+!THIRD-PARTY-NOTICES.md

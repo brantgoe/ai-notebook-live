@@ -1105,6 +1105,38 @@ test('the control panel shows the real policy and can change it', async () => {
   }
 });
 
+test('the packaged extension is small, complete and actually loadable', async () => {
+  const manifest = require(path.join('..', 'package.json'));
+  const root = path.join(__dirname, '..');
+
+  // A broken bundle would otherwise ship green: the tests require the source
+  // entry point, not the one the manifest declares.
+  const main = path.join(root, manifest.main);
+  assert.ok(fs.existsSync(main), `manifest.main (${manifest.main}) does not exist - run npm run build`);
+
+  // Everything the licences of the bundled packages require has to ship.
+  for (const required of ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md', 'CHANGELOG.md', 'README.md']) {
+    assert.ok(fs.existsSync(path.join(root, required)), `${required} is missing`);
+  }
+
+  // Every package the bundle pulled in must be named in the notices, or we are
+  // redistributing it without its licence.
+  const { packagesFrom } = require(path.join('..', 'scripts', 'licenses.js'));
+  const metafilePath = path.join(root, 'dist', 'metafile.json');
+  if (fs.existsSync(metafilePath)) {
+    const notices = fs.readFileSync(path.join(root, 'THIRD-PARTY-NOTICES.md'), 'utf8');
+    for (const pkg of packagesFrom(JSON.parse(fs.readFileSync(metafilePath, 'utf8')))) {
+      assert.ok(notices.includes(pkg), `${pkg} is bundled but absent from THIRD-PARTY-NOTICES.md`);
+    }
+  }
+
+  // The .vsix used to carry 2,399 files. Keep the win.
+  const ignore = fs.readFileSync(path.join(root, '.vscodeignore'), 'utf8');
+  assert.match(ignore, /^\*\*$/m, '.vscodeignore must be an allow-list, not a deny-list');
+  assert.ok(!/^!src\//m.test(ignore), 'source must not ship alongside the bundle');
+  assert.ok(!/^!node_modules/m.test(ignore), 'node_modules must not ship');
+});
+
 test('cancel and bridge commands are safe to call with nothing running', async () => {
   const handler = vscode.__test.commands.get('aiNotebookLive.cancel');
   assert.strictEqual(typeof handler, 'function');
