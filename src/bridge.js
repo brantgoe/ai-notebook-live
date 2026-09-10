@@ -9,6 +9,14 @@ const { log } = require('./log');
 
 const MAX_BODY = 1024 * 1024;
 
+/** An error that knows its own HTTP status, so callers get told the truth. */
+class BridgeError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
 /**
  * Where a bridge advertises its port and token.
  *
@@ -50,7 +58,7 @@ class Bridge {
     this.server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
         log('bridge error:', err && err.message);
-        send(res, 500, { error: String((err && err.message) || err) });
+        send(res, (err && err.status) || 500, { error: String((err && err.message) || err) });
       });
     });
 
@@ -83,43 +91,122 @@ class Bridge {
     this.port = undefined;
     this.token = undefined;
     try {
-      fs.unlinkSync(this.infoFile);
+      // Only remove the advertisement if it is still ours: another window may
+      // have claimed this path since, and deleting theirs would leave their
+      // bridge listening but unreachable.
+      const seen = JSON.parse(fs.readFileSync(this.infoFile, 'utf8'));
+      if (seen.pid === process.pid) fs.unlinkSync(this.infoFile);
     } catch {
-      /* already gone */
+      /* already gone, or not parseable - either way not ours to tidy */
     }
     log('bridge stopped');
   }
 
+  /**
+   * Publishes the port and token for local clients.
+   *
+   * The obvious version of this is wrong in three ways, each verified rather
+   * than assumed:
+   *   - mkdirSync's `mode` is ignored when the directory already exists, so a
+   *     pre-existing 0755 directory silently stayed world-readable.
+   *   - writeFileSync's `mode` is only applied when the file is created, so a
+   *     pre-existing 0666 file received a fresh token and kept its permissions.
+   *   - writeFileSync follows symlinks, so a link at this path meant the token
+   *     JSON overwrote whatever it pointed at.
+   * Hence: chmod the directory explicitly, and create the file with O_EXCL,
+   * which refuses to follow a symlink and refuses to reuse an existing inode.
+   */
   writeInfo() {
+    const payload = `${JSON.stringify(
+      { port: this.port, token: this.token, pid: process.pid },
+      null,
+      2
+    )}\n`;
     try {
       fs.mkdirSync(this.infoDir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(
-        this.infoFile,
-        `${JSON.stringify({ port: this.port, token: this.token, pid: process.pid }, null, 2)}\n`,
-        { mode: 0o600 }
-      );
+      // Applied unconditionally, because mkdirSync's mode did not touch an
+      // existing directory.
+      try {
+        fs.chmodSync(this.infoDir, 0o700);
+      } catch {
+        /* not ours to chmod, or a platform that does not care */
+      }
+      this.writeExclusive(this.infoFile, payload);
     } catch (err) {
       log('could not write bridge info file:', err && err.message);
     }
   }
 
+  writeExclusive(file, payload) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        // 'wx' is O_CREAT|O_EXCL: it will not follow a symlink and will not
+        // reuse a file somebody else left here.
+        const fd = fs.openSync(file, 'wx', 0o600);
+        try {
+          fs.writeSync(fd, payload);
+        } finally {
+          fs.closeSync(fd);
+        }
+        return;
+      } catch (err) {
+        if (err.code !== 'EEXIST' || attempt === 1) throw err;
+        // Something is already here. We know it is not a live bridge on this
+        // port, because listen() would have failed first - so it is stale, or
+        // it is a plant. Either way it does not get to keep the path.
+        fs.unlinkSync(file);
+      }
+    }
+  }
+
+  /**
+   * A ready-to-run command that does NOT contain the token.
+   *
+   * This used to interpolate the live token, and the copy-bridge-info command
+   * put that on the clipboard - from where it goes into shell history, and onto
+   * a projector in a classroom. The token is read from the info file at run
+   * time instead.
+   */
   curlExample() {
+    const read = `$(node -e "process.stdout.write(require('${this.infoFile}').token)")`;
     return [
       `printf 'print("hello from an agent")' | \\`,
-      `  curl -sS -X POST "http://127.0.0.1:${this.port}/cell/stream?run=1" \\`,
-      `    -H "x-ai-notebook-token: ${this.token}" --data-binary @-`,
+      `  curl -sS -X POST "http://127.0.0.1:${this.port}/cell/stream" \\`,
+      `    -H "x-ai-notebook-token: ${read}" --data-binary @-`,
     ].join('\n');
   }
 
-  authorized(req, url) {
+  /**
+   * Header-only, deliberately.
+   *
+   * A cross-origin request carrying x-ai-notebook-token is not a CORS "simple"
+   * request, so the browser must preflight it with OPTIONS - which this server
+   * answers 405 with no CORS headers, so the real request never happens. The
+   * design fails closed by construction. Accepting the token from the query
+   * string used to undo that, since a plain form POST needs no custom header,
+   * and it also wrote a live credential into shell history and proxy logs.
+   */
+  authorized(req) {
+    // No legitimate client sends Origin; every browser does.
+    if (req.headers.origin) return false;
+    // The other half of DNS-rebinding defence: a rebound name would not match.
+    const host = String(req.headers.host || '');
+    const hostname = host.replace(/:\d+$/, '');
+    if (hostname !== '127.0.0.1' && hostname !== 'localhost' && hostname !== '[::1]') return false;
+
     const header = req.headers['x-ai-notebook-token'];
-    const supplied = Array.isArray(header) ? header[0] : header || url.searchParams.get('token');
-    return Boolean(supplied) && supplied === this.token;
+    const supplied = Array.isArray(header) ? header[0] : header;
+    if (typeof supplied !== 'string' || !this.token) return false;
+    const a = Buffer.from(supplied);
+    const b = Buffer.from(this.token);
+    // Equal length is required by timingSafeEqual, and a length mismatch is
+    // already a definitive answer.
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
   async handle(req, res) {
     const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
-    if (req.method === 'GET' && url.pathname === '/health' && this.authorized(req, url)) {
+    if (req.method === 'GET' && url.pathname === '/health' && this.authorized(req)) {
       const notebook = this.resolveNotebook();
       return send(res, 200, {
         ok: true,
@@ -127,7 +214,7 @@ class Bridge {
         cells: notebook ? notebook.cellCount : 0,
       });
     }
-    if (!this.authorized(req, url)) return send(res, 401, { error: 'bad or missing token' });
+    if (!this.authorized(req)) return send(res, 401, { error: 'bad or missing token' });
     if (req.method !== 'POST') return send(res, 405, { error: 'use POST' });
 
     if (url.pathname === '/cell') {
@@ -139,7 +226,7 @@ class Bridge {
         writer.write(code);
         return send(res, 200, await this.closeWriter(writer, { ...body, search: url.searchParams }));
       } catch (err) {
-        await writer.drop();
+        await writer.abandon();
         throw err;
       }
     }
@@ -153,13 +240,17 @@ class Bridge {
       try {
         for await (const chunk of req) {
           size += chunk.length;
-          if (size > MAX_BODY) throw new Error('body too large');
+          if (size > MAX_BODY) throw new BridgeError('body too large', 413);
           writer.write(chunk);
         }
       } catch (err) {
-        // The push was rejected, so take the half-written cell back out.
-        await writer.drop();
-        return send(res, 413, { error: String((err && err.message) || err) });
+        // The push failed, so take the half-written cell back out. Note the
+        // status comes from the error: a client that hung up is a 400, not the
+        // 413 every failure in this loop used to report.
+        await writer.abandon();
+        return send(res, (err && err.status) || 400, {
+          error: String((err && err.message) || err),
+        });
       }
       return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
     }
@@ -169,7 +260,7 @@ class Bridge {
 
   async openWriter(options) {
     const notebook = this.resolveNotebook(options.notebook || options.search.get('notebook'));
-    if (!notebook) throw new Error('no notebook is open in VS Code');
+    if (!notebook) throw new BridgeError('no notebook is open in VS Code', 409);
     const kind = options.kind || options.search.get('kind') || 'code';
     const index = resolvePosition(
       notebook,
@@ -244,14 +335,14 @@ async function readJson(req) {
   req.setEncoding('utf8');
   for await (const chunk of req) {
     body += chunk;
-    if (body.length > MAX_BODY) throw new Error('body too large');
+    if (body.length > MAX_BODY) throw new BridgeError('body too large', 413);
   }
   if (!body.trim()) return {};
   try {
     return JSON.parse(body);
   } catch {
-    throw new Error('body is not valid JSON');
+    throw new BridgeError('body is not valid JSON', 400);
   }
 }
 
-module.exports = { Bridge, defaultInfoDir };
+module.exports = { Bridge, BridgeError, defaultInfoDir };

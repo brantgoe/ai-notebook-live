@@ -481,11 +481,17 @@ test('the bridge never makes an HTTP caller wait on a dialog', async () => {
 
 /* -------------------------------- bridge -------------------------------- */
 
-function call(port, token, { method = 'POST', path: p = '/cell', body, chunks }) {
+function call(port, token, { method = 'POST', path: p = '/cell', body, chunks, headers = {} }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const req = http.request(
-      { host: '127.0.0.1', port, method, path: p, headers: token ? { 'x-ai-notebook-token': token } : {} },
+      {
+        host: '127.0.0.1',
+        port,
+        method,
+        path: p,
+        headers: { ...(token ? { 'x-ai-notebook-token': token } : {}), ...headers },
+      },
       (res) => {
         let text = '';
         res.on('data', (c) => {
@@ -561,8 +567,11 @@ test('bridge inserts, streams, runs, and rejects bad tokens', async () => {
     assert.strictEqual(markdown.status, 200);
     assert.strictEqual(notebook.cellAt(0).kind, vscode.NotebookCellKind.Markup);
 
+    // Malformed JSON is the caller's mistake, so it is a 400 - it used to be
+    // reported as a 500, which blamed the server for the client's bad request.
     const bad = await call(port, token, { body: '{not json' });
-    assert.strictEqual(bad.status, 500);
+    assert.strictEqual(bad.status, 400);
+    assert.match(bad.body, /not valid JSON/);
   } finally {
     await bridge.stop();
   }
@@ -613,6 +622,113 @@ test('an over-sized push is rejected and leaves no half-written cell behind', as
   }
 });
 
+test('the bridge is not reachable from a web page', async () => {
+  const notebook = newNotebook(['x = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const body = JSON.stringify({ code: 'print("should never land")' });
+
+    // The token in the query string made a plain cross-origin form POST enough,
+    // because it needs no custom header and therefore no preflight.
+    const viaQuery = await call(port, undefined, { path: `/cell?token=${token}`, body });
+    assert.strictEqual(viaQuery.status, 401, 'a token in the URL is not accepted');
+
+    // Browsers always send Origin; curl and nbpush never do.
+    const withOrigin = await call(port, token, { body, headers: { origin: 'https://evil.example' } });
+    assert.strictEqual(withOrigin.status, 401, 'anything with an Origin is refused');
+
+    // A rebound DNS name arrives with its own Host.
+    const rebound = await call(port, token, { body, headers: { host: 'evil.example' } });
+    assert.strictEqual(rebound.status, 401, 'only loopback hostnames are served');
+
+    assert.strictEqual(notebook.cellCount, 1, 'and none of them wrote anything');
+
+    // The legitimate client still works.
+    const ok = await call(port, token, { path: '/cell?position=end', body });
+    assert.strictEqual(ok.status, 200);
+    assert.strictEqual(notebook.cellCount, 2);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('the example command does not contain the token', async () => {
+  const notebook = newNotebook(['x = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { token } = await bridge.start(0);
+  try {
+    const example = bridge.curlExample();
+    assert.ok(
+      !example.includes(token),
+      'a live credential must not be put on the clipboard - it ends up in shell history'
+    );
+    assert.match(example, /x-ai-notebook-token/, 'it still sends the header');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('the token file is not written through a symlink, and tightens a loose directory', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-nb-perm-'));
+  const victim = path.join(dir, 'precious.txt');
+  fs.writeFileSync(victim, 'DO NOT CLOBBER');
+  fs.symlinkSync(victim, path.join(dir, 'bridge.json'));
+  fs.chmodSync(dir, 0o755);
+
+  const notebook = newNotebook(['x = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: dir,
+  });
+  await bridge.start(0);
+  try {
+    assert.strictEqual(
+      fs.readFileSync(victim, 'utf8'),
+      'DO NOT CLOBBER',
+      'writeFileSync would have followed the symlink and overwritten this'
+    );
+    const info = JSON.parse(fs.readFileSync(path.join(dir, 'bridge.json'), 'utf8'));
+    assert.strictEqual(info.pid, process.pid, 'the real token file replaced the link');
+    if (process.platform !== 'win32') {
+      assert.strictEqual(
+        fs.statSync(dir).mode & 0o777,
+        0o700,
+        "mkdirSync's mode is ignored on an existing directory, so it must be chmod'd"
+      );
+      assert.strictEqual(fs.statSync(path.join(dir, 'bridge.json')).mode & 0o777, 0o600);
+    }
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('stopping one window does not delete another window\'s token file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-nb-own-'));
+  const notebook = newNotebook(['x = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: dir,
+  });
+  await bridge.start(0);
+  // Pretend another VS Code window claimed the path after we advertised.
+  const file = path.join(dir, 'bridge.json');
+  fs.writeFileSync(file, JSON.stringify({ port: 1, token: 'theirs', pid: process.pid + 1 }));
+  await bridge.stop();
+  assert.ok(fs.existsSync(file), 'we must not tidy away a file that is not ours');
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).token, 'theirs');
+});
+
 test('the bridge writes its token only inside the directory it was given', async () => {
   // Regression: infoDir used to be a module constant, so running this suite
   // clobbered and then deleted the token file of a live bridge in another window.
@@ -643,7 +759,7 @@ test('bridge refuses to start when no notebook is open', async () => {
   const { port, token } = await bridge.start(0);
   try {
     const res = await call(port, token, { body: JSON.stringify({ code: 'x = 1' }) });
-    assert.strictEqual(res.status, 500);
+    assert.strictEqual(res.status, 409, 'nothing to write into is a conflict, not a server fault');
     assert.match(res.body, /no notebook is open/);
   } finally {
     await bridge.stop();

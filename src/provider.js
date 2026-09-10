@@ -331,6 +331,13 @@ function streamCli({ system, user, opts, token, onText, binary }) {
 
     child.on('error', (err) => {
       if (cancel) cancel.dispose();
+      // Leaving it alive meant its stdout handlers kept calling writer.write()
+      // into a writer the caller had already closed.
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
       reject(
         err.code === 'ENOENT'
           ? new ProviderError('The `claude` CLI was not found on PATH.', { action: 'install' })
@@ -352,6 +359,14 @@ function streamCli({ system, user, opts, token, onText, binary }) {
       resolve({ provider: 'claude-cli', model, stopReason: 'end_turn' });
     });
 
+    // The prompt carries the whole notebook context, so this write is often
+    // still queued in the pipe buffer when the child goes away - on cancel, or
+    // when the CLI exits immediately because it is not logged in. Without a
+    // listener that EPIPE is an uncaught exception, which takes down the
+    // extension host and every other extension in the window with it.
+    child.stdin.on('error', (err) => {
+      log('claude CLI stdin closed early:', (err && err.code) || String(err));
+    });
     child.stdin.end(user, 'utf8');
   });
 }
