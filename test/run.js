@@ -3141,7 +3141,7 @@ test('the packaged extension is small, complete and actually loadable', async ()
   assert.strictEqual(typeof bundled.deactivate, 'function', 'and deactivate');
 
   // Everything the licences of the bundled packages require has to ship.
-  for (const required of ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md', 'CHANGELOG.md', 'README.md']) {
+  for (const required of ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md', 'CHANGELOG.md', 'README.md', 'SECURITY.md']) {
     assert.ok(fs.existsSync(path.join(root, required)), `${required} is missing`);
   }
 
