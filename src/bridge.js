@@ -225,10 +225,12 @@ class Bridge {
       // the options bag, so any key a caller invented became an option - and
       // body keys beat the query string. Options come from the URL, which is
       // also what the README has always documented.
-      const code = typeof body.code === 'string' ? body.code : body.text;
-      if (typeof code !== 'string') {
+      const raw = typeof body.code === 'string' ? body.code : body.text;
+      if (typeof raw !== 'string') {
         return send(res, 400, { error: 'body needs a "code" string' });
       }
+      // Checked before the cell is created, so a rejected push leaves nothing.
+      const code = validate.cellText(raw);
       const writer = await this.openWriter({ search: url.searchParams });
       try {
         writer.write(code);
@@ -253,6 +255,10 @@ class Bridge {
         for await (const chunk of req) {
           size += chunk.length;
           if (size > MAX_BODY) throw new BridgeError('body too large', 413);
+          // Per chunk, before anything is written. Node's utf8 decoder joins
+          // multi-byte sequences split across chunks, so a surrogate pair is
+          // never torn apart here - an unpaired one really was sent as one.
+          validate.cellText(chunk);
           if (!writer) writer = await this.openWriter({ search: url.searchParams });
           writer.write(chunk);
         }

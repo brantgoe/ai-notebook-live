@@ -2,7 +2,7 @@
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
   "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let external AI agents push cells in live over a localhost bridge.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {

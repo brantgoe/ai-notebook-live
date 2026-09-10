@@ -130,9 +130,25 @@ function chooseInput(args, { isTTY = process.stdin.isTTY } = {}) {
   return { kind: 'stdin' };
 }
 
+/**
+ * Reads the bridge's advertisement, and refuses to trust a stale one.
+ *
+ * This used to hand back whatever JSON.parse produced. That mattered far more
+ * than the confusing error messages it caused: after VS Code exits without
+ * running deactivate() - a crash, an OOM kill, a reboot - the file survives
+ * naming a dead process and a port. If anything else later binds that port,
+ * piping code into nbpush sent that code, and the token, to a stranger, and
+ * printed {"ok":true}.
+ *
+ * The pid check is what closes that. It is not a defence against a hostile
+ * local process - anything running as this user can read the token file anyway
+ * - but the realistic case is an accidental collision after a crash, and a
+ * dead pid identifies it exactly.
+ */
 function readInfo() {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(INFO_FILE, 'utf8'));
+    raw = fs.readFileSync(INFO_FILE, 'utf8');
   } catch {
     process.stderr.write(
       `nbpush: no bridge found at ${INFO_FILE}\n` +
@@ -140,6 +156,105 @@ function readInfo() {
     );
     return process.exit(1);
   }
+
+  let info;
+  try {
+    info = JSON.parse(raw);
+  } catch {
+    return stale('it is not valid JSON');
+  }
+  if (info === null || typeof info !== 'object' || Array.isArray(info)) {
+    return stale('it is not an object');
+  }
+  if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535) {
+    return stale(`the port is ${JSON.stringify(info.port)}`);
+  }
+  if (typeof info.token !== 'string' || info.token.length === 0) {
+    return stale('it has no token');
+  }
+  if (!Number.isInteger(info.pid) || !alive(info.pid)) {
+    return stale(
+      `the process that wrote it (${info.pid}) is gone. Something else may be ` +
+        `listening on port ${info.port} now, so nothing was sent`
+    );
+  }
+  return info;
+}
+
+function stale(why) {
+  process.stderr.write(
+    `nbpush: the bridge file at ${INFO_FILE} is stale - ${why}.\n` +
+      'Run "AI Notebook: Start Local Agent Bridge" in VS Code to write a fresh one.\n'
+  );
+  return process.exit(1);
+}
+
+function alive(pid) {
+  try {
+    // Signal 0 tests for existence without delivering anything.
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the pid exists but belongs to somebody else, which our own
+    // bridge never would.
+    return false;
+  }
+}
+
+/**
+ * Confirms the thing on that port is actually our bridge before handing it the
+ * payload. Catches an accidental collision - some unrelated service that has
+ * taken the port - rather than a deliberate impostor, which would have the
+ * token from the file anyway.
+ */
+async function confirmBridge(info) {
+  // Probe WITHOUT the token first. Our bridge refuses an unauthenticated
+  // request with a distinctive body, so a wrong listener can be identified
+  // before it is handed a credential - it is not only the code that should not
+  // leak to whatever happens to own the port.
+  try {
+    const anon = await request({ ...info, token: undefined }, { method: 'GET', pathname: '/health' });
+    if (anon.status !== 401 || !/bad or missing token/.test(anon.text)) {
+      process.stderr.write(
+        `nbpush: whatever is listening on 127.0.0.1:${info.port} is not the AI Notebook ` +
+          'bridge. Nothing was sent.\n'
+      );
+      return process.exit(1);
+    }
+  } catch (err) {
+    process.stderr.write(
+      `nbpush: could not reach a bridge on 127.0.0.1:${info.port} (${(err && err.code) || err}).\n`
+    );
+    return process.exit(1);
+  }
+
+  let res;
+  try {
+    res = await request(info, { method: 'GET', pathname: '/health' });
+  } catch (err) {
+    process.stderr.write(
+      `nbpush: could not reach a bridge on 127.0.0.1:${info.port} (${(err && err.code) || err}).\n`
+    );
+    return process.exit(1);
+  }
+  if (res.status !== 200) {
+    process.stderr.write(`nbpush: ${res.status} from 127.0.0.1:${info.port}: ${res.text}\n`);
+    return process.exit(1);
+  }
+  let health;
+  try {
+    health = JSON.parse(res.text);
+  } catch {
+    health = undefined;
+  }
+  if (!health || health.ok !== true || !('notebook' in health)) {
+    process.stderr.write(
+      `nbpush: whatever is listening on 127.0.0.1:${info.port} is not the AI Notebook ` +
+        'bridge. Nothing was sent.\n'
+    );
+    return process.exit(1);
+  }
+  return health;
 }
 
 function request(info, { method, pathname, search, body, stream }) {
@@ -150,7 +265,10 @@ function request(info, { method, pathname, search, body, stream }) {
         port: info.port,
         method,
         path: search ? `${pathname}?${search}` : pathname,
-        headers: { 'x-ai-notebook-token': info.token, 'content-type': 'application/json' },
+        headers: {
+          ...(info.token ? { 'x-ai-notebook-token': info.token } : {}),
+          'content-type': 'application/json',
+        },
       },
       (res) => {
         let text = '';
@@ -183,6 +301,9 @@ async function main() {
     return process.exit(2);
   }
 
+  // Before a single byte of the payload goes anywhere.
+  const health = await confirmBridge(info);
+
   const search = new URLSearchParams();
   if (args.kind === 'markdown') search.set('kind', 'markdown');
   if (args.position !== undefined) search.set('position', args.position);
@@ -190,14 +311,8 @@ async function main() {
   if (args.notebook) search.set('notebook', args.notebook);
 
   if (args.dryRun) {
-    const health = await request(info, { method: 'GET', pathname: '/health' });
-    if (health.status !== 200) {
-      process.stderr.write(`nbpush: ${health.status} ${health.text}\n`);
-      return process.exit(1);
-    }
-    const target = JSON.parse(health.text).notebook;
     process.stderr.write(
-      `nbpush: would add a ${args.kind} cell to ${target}\n` +
+      `nbpush: would add a ${args.kind} cell to ${health.notebook}\n` +
         `  options: ${search.toString() || '(defaults)'}\n` +
         `  body:    ${input.kind}\n`
     );
@@ -245,4 +360,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, chooseInput, INFO_FILE };
+module.exports = { parseArgs, chooseInput, readInfo, alive, INFO_FILE };

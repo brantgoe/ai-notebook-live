@@ -100,11 +100,79 @@ function oneOf(value, allowed, fallback) {
   return allowed.includes(word) ? word : fallback;
 }
 
+
+/**
+ * Text that is about to become a notebook cell.
+ *
+ * Refuses rather than sanitises: silently altering somebody's code is exactly
+ * the content loss this project spent a release removing. A caller that sent
+ * something unusable deserves to be told which character.
+ *
+ * What is refused, and why each one matters:
+ *
+ *  - LONE SURROGATES. VS Code writes notebooks with JavaScript, which escapes
+ *    an unpaired surrogate happily. Python - which is nbformat, nbconvert,
+ *    papermill, and effectively the whole notebook toolchain - can READ that
+ *    file but cannot write it back out: UnicodeEncodeError. One pushed cell
+ *    makes the notebook unprocessable, with an error that names Unicode rather
+ *    than the cell that caused it.
+ *  - NUL, and the other C0 controls. `compile()` refuses a NUL outright
+ *    ("source code string cannot contain null bytes"), so the cell looks fine,
+ *    saves fine, and fails at execution with a message that never names it.
+ *  - U+2028 and U+2029. Python calls these "invalid non-printable character".
+ *
+ * Tab, newline and carriage return are allowed. A literal ESC is not, which is
+ * worth explaining because it looks over-strict: a colour code in Python source
+ * is written "\\x1b[31m" - backslash, x, 1, b - which is ordinary ASCII and
+ * passes untouched. A RAW ESC byte in the source of a cell is almost always an
+ * accident or an injection, and refusing it costs nobody anything.
+ */
+function cellText(value, { field = 'code' } = {}) {
+  if (typeof value !== 'string') {
+    throw new InvalidInput(`${field} must be a string`);
+  }
+  for (let i = 0; i < value.length; i += 1) {
+    const c = value.charCodeAt(i);
+    if (c === 0x09 || c === 0x0a || c === 0x0d) continue;
+    if (c < 0x20 || c === 0x7f) {
+      throw new InvalidInput(
+        `${field} contains a control character (U+${c.toString(16).toUpperCase().padStart(4, '0')}) ` +
+          `at position ${i}, which a notebook kernel cannot run`
+      );
+    }
+    if (c === 0x2028 || c === 0x2029) {
+      throw new InvalidInput(
+        `${field} contains U+${c.toString(16).toUpperCase()} at position ${i}, ` +
+          'which Python rejects as a non-printable character'
+      );
+    }
+    // A high surrogate must be followed by a low one, and a low one must not
+    // appear alone. Either way round, the result cannot be encoded as UTF-8.
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        throw new InvalidInput(
+          `${field} contains an unpaired surrogate at position ${i}. The notebook ` +
+            'would become unreadable to nbformat, nbconvert and papermill'
+        );
+      }
+      i += 1;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      throw new InvalidInput(
+        `${field} contains an unpaired surrogate at position ${i}. The notebook ` +
+          'would become unreadable to nbformat, nbconvert and papermill'
+      );
+    }
+  }
+  return value;
+}
+
 module.exports = {
   InvalidInput,
   clamp,
   inRangeOr,
   cellKind,
+  cellText,
   cellPosition,
   cellLanguage,
   boolish,

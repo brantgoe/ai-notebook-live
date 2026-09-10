@@ -671,6 +671,48 @@ test('nbpush accepts the arguments it should', () => {
   assert.strictEqual(nbpush.parseArgs(['analysis.py']).file, 'analysis.py');
 });
 
+test('nbpush will not talk to a bridge whose process is gone', () => {
+  // The exfiltration case. After VS Code exits without deactivate() - a crash,
+  // an OOM kill, a reboot - the advertisement survives naming a dead pid and a
+  // port. If anything else later binds that port, piping code into nbpush used
+  // to send that code AND the token to it, and print {"ok":true}.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nbpush-stale-'));
+  const file = path.join(dir, 'bridge.json');
+  const realExit = process.exit;
+  const realWrite = process.stderr.write;
+  let said = '';
+  process.stderr.write = (chunk) => {
+    said += chunk;
+    return true;
+  };
+  process.exit = (code) => {
+    const err = new Error(`exit ${code}`);
+    err.exitCode = code;
+    throw err;
+  };
+  const read = () => {
+    const saved = process.env.AI_NOTEBOOK_LIVE_HOME;
+    process.env.AI_NOTEBOOK_LIVE_HOME = dir;
+    try {
+      // INFO_FILE is captured at require time, so point the reader at ours.
+      return nbpush.readInfoFrom ? nbpush.readInfoFrom(file) : nbpush.readInfo();
+    } finally {
+      process.env.AI_NOTEBOOK_LIVE_HOME = saved;
+    }
+  };
+  try {
+    // A pid nothing could plausibly own.
+    assert.ok(!nbpush.alive(0x7ffffffe), 'a made-up pid must not read as alive');
+    // ...and our own is.
+    assert.ok(nbpush.alive(process.pid), 'this process is alive');
+  } finally {
+    process.exit = realExit;
+    process.stderr.write = realWrite;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.strictEqual(said, '', 'nothing should have been reported for a liveness check');
+});
+
 test('nbpush looks for the bridge where the bridge actually writes it', () => {
   // These disagreed: the bridge honoured AI_NOTEBOOK_LIVE_HOME and nbpush did
   // not, so the suite could not drive nbpush without clobbering a real bridge.
@@ -689,6 +731,40 @@ test('validate.js depends on nothing, so every layer can use it', () => {
   // validator is only shareable while it requires nothing at all.
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'validate.js'), 'utf8');
   assert.ok(!/\brequire\s*\(/.test(source), 'src/validate.js must not require anything');
+});
+
+test('text that would poison the notebook is refused, not written', () => {
+  // Each of these is accepted by JSON and by JavaScript, and each breaks
+  // something downstream that the user would have to diagnose from a message
+  // naming Unicode rather than the cell.
+  const NUL = String.fromCharCode(0);
+  const ESC = String.fromCharCode(27);
+  const poison = [
+    ['NUL byte', `a${NUL}b`, /control character \(U\+0000\)/],
+    ['raw ESC', `x${ESC}[31m`, /control character \(U\+001B\)/],
+    ['unpaired high surrogate', 'a\ud800b', /unpaired surrogate/],
+    ['unpaired low surrogate', 'a\udc00b', /unpaired surrogate/],
+    ['high surrogate at the end', 'ab\ud800', /unpaired surrogate/],
+    ['U+2028', 'a\u2028b', /U\+2028/],
+    ['U+2029', 'a\u2029b', /U\+2029/],
+  ];
+  for (const [name, text, pattern] of poison) {
+    assert.throws(() => validate.cellText(text), pattern, name);
+  }
+
+  // ...and everything legitimate still passes, including the escaped form of an
+  // ANSI colour code, which is what Python source actually contains.
+  const fine = [
+    'print("hello")',
+    'def f():\n\tif x:\r\n\t\treturn 1',
+    's = "café 日本語 😀"',
+    'print("\\x1b[31mred\\x1b[0m")',
+    '',
+  ];
+  for (const text of fine) {
+    assert.strictEqual(validate.cellText(text), text, JSON.stringify(text.slice(0, 24)));
+  }
+  assert.throws(() => validate.cellText(42), /must be a string/);
 });
 
 test('validation forgives casing and spacing but refuses guesses', () => {
@@ -1161,6 +1237,47 @@ test('a body key cannot smuggle itself in as an option', async () => {
     });
     assert.strictEqual(smuggled.status, 200, 'text is still a documented alias');
     assert.strictEqual(notebook.cellAt(JSON.parse(smuggled.body).index).document.getText(), 'print("smuggled")');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a poisoned push is refused by the bridge and leaves no cell', async () => {
+  const notebook = newNotebook(['seed = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const before = notebook.cellCount;
+    for (const [name, escaped] of [
+      ['NUL', 'a\\u0000b'],
+      ['unpaired surrogate', 'a\\ud800b'],
+      ['U+2028', 'a\\u2028b'],
+    ]) {
+      const res = await call(port, token, { body: `{"code":"${escaped}"}` });
+      assert.strictEqual(res.status, 400, name);
+      assert.strictEqual(notebook.cellCount, before, `${name} must not create a cell`);
+    }
+
+    // Streaming is checked per chunk, before the writer is even opened. NUL is
+    // used rather than a surrogate on purpose: a lone surrogate CANNOT reach
+    // this route, because the sender encodes to UTF-8 and an unpaired one
+    // becomes U+FFFD in transit. Only the JSON route can carry one, since
+    // \ud800 there is an escape decoded after the bytes have arrived.
+    const streamed = await call(port, token, {
+      path: '/cell/stream?position=end',
+      chunks: ['print(1)', `a${String.fromCharCode(0)}b`],
+    });
+    assert.strictEqual(streamed.status, 400);
+    assert.strictEqual(notebook.cellCount, before, 'a poisoned chunk leaves nothing behind');
+
+    // A valid surrogate PAIR is ordinary text and must still work.
+    const emoji = await call(port, token, { path: '/cell?position=end', body: '{"code":"a\\ud83d\\ude00b"}' });
+    assert.strictEqual(emoji.status, 200);
+    assert.strictEqual(notebook.cellAt(JSON.parse(emoji.body).index).document.getText(), 'a\u{1F600}b');
   } finally {
     await bridge.stop();
   }

@@ -29,7 +29,7 @@ needs VS Code's `NotebookEdit` API, which is what this extension uses.
 
 1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
 2. ```bash
-   code --install-extension ai-notebook-live-0.3.0.vsix
+   code --install-extension ai-notebook-live-0.3.1.vsix
    ```
 3. Reload the window.
 
@@ -210,7 +210,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 69 tests, no VS Code needed
+npm test          # 72 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

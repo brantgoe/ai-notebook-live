@@ -7,6 +7,39 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.3.1] — 2026-09-09
+
+Two items filed as rough edges in the 0.2.0 review turned out to be neither.
+
+### Fixed
+
+- **`nbpush` could send your code to another program entirely.** The bridge
+  records the process that owns it; `nbpush` never checked that process was
+  still alive. After VS Code exits without shutting down cleanly — a crash, an
+  OOM kill, a reboot — the advertisement survives naming a dead process and a
+  port, and anything else that later binds that port received the code you piped
+  in, and the token, while `nbpush` printed `{"ok":true}`. Reproduced against a
+  stand-in listener before and after.
+
+  `nbpush` now refuses a stale advertisement, checks the process is alive, and
+  confirms the thing on that port really is the bridge — probing first *without*
+  the token, so a wrong listener never receives a credential either. It also
+  validates the file's shape, which is what makes the error messages readable
+  instead of raw Node internals.
+
+- **Text that poisons a notebook is refused instead of written.** An unpaired
+  surrogate is the serious one: VS Code saves notebooks with JavaScript, which
+  escapes one happily, but Python — `nbformat`, `nbconvert`, `papermill` — can
+  read that file and then **cannot write it back out**. One pushed cell makes
+  the notebook unprocessable by the whole toolchain, with an error naming
+  Unicode rather than the cell. NUL bytes and U+2028 are quieter: they save
+  fine and then fail at execution with a message that never names the cell.
+
+  These are refused rather than silently cleaned up, because altering somebody's
+  code without telling them is the failure this project spent 0.3.0 removing.
+  Escape sequences written the normal way — `"\x1b[31m"` in Python source — are
+  ordinary ASCII and unaffected.
+
 ## [0.3.0] — 2026-09-09
 
 Adversarial testing of 0.2.0 found thirteen bugs; mapping the code to fix them
