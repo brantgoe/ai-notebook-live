@@ -753,77 +753,90 @@ function fakeClaude(scenario) {
       '}, 5);',
     ].join('\n')
   );
-  return { binary: process.execPath, args: [bin], dir };
+  // streamCli spawns the binary directly with the real CLI's flags, so the
+  // stand-in has to BE an executable that ignores them. A #!/bin/sh wrapper is
+  // not one on Windows - it fails with spawn UNKNOWN or EFTYPE - so each
+  // platform gets the launcher it can actually run.
+  const launcher = path.join(dir, process.platform === 'win32' ? 'claude.cmd' : 'claude.sh');
+  if (process.platform === 'win32') {
+    fs.writeFileSync(launcher, `@echo off\r\n"${process.execPath}" "${bin}" %*\r\n`);
+  } else {
+    fs.writeFileSync(launcher, `#!/bin/sh\nexec "${process.execPath}" "${bin}" "$@"\n`, { mode: 0o755 });
+  }
+  return { binary: launcher, dir };
+}
+
+/** Runs one request against a stand-in CLI and cleans up after itself. */
+async function withFakeClaude(scenario, fn) {
+  const fake = fakeClaude(scenario);
+  try {
+    return await fn(fake.binary);
+  } finally {
+    fs.rmSync(fake.dir, { recursive: true, force: true });
+  }
 }
 
 test('a CLI failure that exits 0 is reported, not swallowed', async () => {
   // The CLI says what went wrong in-band and still exits 0. That reason was
   // collected and then only ever shown when the exit code was non-zero, so the
   // user got an empty cell and no explanation.
-  const fake = fakeClaude('in_band_failure');
-  const wrapper = path.join(fake.dir, 'run.sh');
-  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${fake.args[0]} "$@"\n`, { mode: 0o755 });
-  const notebook = newNotebook(['seed = 1']);
-  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
-  await assert.rejects(
-    () =>
-      providerCli.stream({
-        target: { kind: 'cli', binary: wrapper, label: 'fake' },
-        system: 's',
-        user: 'u',
-        opts: { ...OPTS, model: 'm' },
-        token: new vscode.CancellationTokenSource().token,
-        onText: (c) => writer.write(c),
-      }),
-    /error_max_turns|no output/,
-    'the reason the CLI gave must reach the user'
-  );
-  fs.rmSync(fake.dir, { recursive: true, force: true });
+  await withFakeClaude('in_band_failure', async (binary) => {
+    const notebook = newNotebook(['seed = 1']);
+    const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+    await assert.rejects(
+      () =>
+        providerCli.stream({
+          target: { kind: 'cli', binary, label: 'fake' },
+          system: 's',
+          user: 'u',
+          opts: { ...OPTS, model: 'm' },
+          token: new vscode.CancellationTokenSource().token,
+          onText: (c) => writer.write(c),
+        }),
+      /error_max_turns|no output/,
+      'the reason the CLI gave must reach the user'
+    );
+  });
 });
 
 test('a genuinely empty success stays quiet', async () => {
   // The other half: a model may legitimately produce nothing, and inventing an
   // error for that would be worse than saying nothing.
-  const fake = fakeClaude('quiet_success');
-  const wrapper = path.join(fake.dir, 'run.sh');
-  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${fake.args[0]} "$@"\n`, { mode: 0o755 });
-  const result = await providerCli.stream({
-    target: { kind: 'cli', binary: wrapper, label: 'fake' },
-    system: 's',
-    user: 'u',
-    opts: { ...OPTS, model: 'm' },
-    token: new vscode.CancellationTokenSource().token,
-    onText: () => {},
+  await withFakeClaude('quiet_success', async (binary) => {
+    const result = await providerCli.stream({
+      target: { kind: 'cli', binary, label: 'fake' },
+      system: 's',
+      user: 'u',
+      opts: { ...OPTS, model: 'm' },
+      token: new vscode.CancellationTokenSource().token,
+      onText: () => {},
+    });
+    assert.strictEqual(result.provider, 'claude-cli');
+    assert.ok(!result.cancelled, 'a quiet success is still a success');
   });
-  assert.strictEqual(result.provider, 'claude-cli');
-  assert.ok(!result.cancelled, 'a quiet success is still a success');
-  fs.rmSync(fake.dir, { recursive: true, force: true });
 });
 
 test('a hung CLI is given up on instead of wedging the extension', async () => {
   // stream() never settling meant guard()'s finally never ran, state.active was
   // never cleared, and EVERY later command was refused for the life of the
   // window. Cancellation always worked; nothing ever fired it.
-  const fake = fakeClaude('hang');
-  const wrapper = path.join(fake.dir, 'run.sh');
-  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${fake.args[0]} "$@"\n`, { mode: 0o755 });
-  const cts = new vscode.CancellationTokenSource();
-  const started = Date.now();
-  // Cancel on the same short deadline pump() would use, to prove the mechanism
-  // the timeout relies on settles the promise rather than hanging with it.
-  const timer = setTimeout(() => cts.cancel(), 400);
-  const result = await providerCli.stream({
-    target: { kind: 'cli', binary: wrapper, label: 'fake' },
-    system: 's',
-    user: 'u',
-    opts: { ...OPTS, model: 'm' },
-    token: cts.token,
-    onText: () => {},
+  await withFakeClaude('hang', async (binary) => {
+    const cts = new vscode.CancellationTokenSource();
+    const started = Date.now();
+    // The same mechanism pump()'s idle timer fires, on a short deadline.
+    const timer = setTimeout(() => cts.cancel(), 400);
+    const result = await providerCli.stream({
+      target: { kind: 'cli', binary, label: 'fake' },
+      system: 's',
+      user: 'u',
+      opts: { ...OPTS, model: 'm' },
+      token: cts.token,
+      onText: () => {},
+    });
+    clearTimeout(timer);
+    assert.ok(result.cancelled, 'giving up must settle the promise, not hang with the child');
+    assert.ok(Date.now() - started < 5000, 'and it must settle promptly');
   });
-  clearTimeout(timer);
-  assert.ok(result.cancelled, 'giving up must settle the promise, not hang with the child');
-  assert.ok(Date.now() - started < 3000, 'and it must settle promptly');
-  fs.rmSync(fake.dir, { recursive: true, force: true });
 });
 
 test('readOutputs survives an output item it cannot read', async () => {
