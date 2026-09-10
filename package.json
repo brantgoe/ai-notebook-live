@@ -9,22 +9,20 @@
     "vscode": "^1.90.0"
   },
   "categories": [
+    "AI",
     "Notebooks",
-    "Machine Learning",
-    "Other"
+    "Machine Learning"
   ],
   "keywords": [
     "jupyter",
     "notebook",
     "claude",
-    "anthropic",
     "ai",
     "codegen"
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "onNotebook:jupyter-notebook",
-    "onNotebook:interactive"
+    "onNotebook:jupyter-notebook"
   ],
   "contributes": {
     "commands": [
@@ -100,19 +98,13 @@
         "command": "aiNotebookLive.generate",
         "key": "ctrl+alt+g",
         "mac": "cmd+alt+g",
-        "when": "notebookEditorFocused"
+        "when": "notebookEditorFocused && !inputFocus && !aiNotebookLive.generating"
       },
       {
         "command": "aiNotebookLive.reviseCell",
         "key": "ctrl+alt+r",
         "mac": "cmd+alt+r",
-        "when": "notebookEditorFocused"
-      },
-      {
-        "command": "aiNotebookLive.fixError",
-        "key": "ctrl+alt+f",
-        "mac": "cmd+alt+f",
-        "when": "notebookEditorFocused"
+        "when": "notebookEditorFocused && !inputFocus && !aiNotebookLive.generating"
       }
     ],
     "menus": {
@@ -120,30 +112,33 @@
         {
           "command": "aiNotebookLive.generate",
           "group": "navigation/execute@10",
-          "when": "notebookType == 'jupyter-notebook' || notebookType == 'interactive'"
+          "when": "notebookType == 'jupyter-notebook' && notebookEditable"
         }
       ],
       "notebook/cell/title": [
         {
           "command": "aiNotebookLive.reviseCell",
           "group": "inline@10",
-          "when": "notebookType == 'jupyter-notebook'"
+          "when": "notebookType == 'jupyter-notebook' && notebookCellType == 'code' && notebookEditable && !aiNotebookLive.generating"
         },
         {
           "command": "aiNotebookLive.fixError",
           "group": "inline@11",
-          "when": "notebookType == 'jupyter-notebook' && notebookCellHasOutputs"
+          "when": "notebookType == 'jupyter-notebook' && notebookCellType == 'code' && notebookEditable && !aiNotebookLive.generating && notebookCellHasOutputs"
         },
         {
           "command": "aiNotebookLive.explainCell",
           "group": "aiNotebook@1",
-          "when": "notebookType == 'jupyter-notebook'"
+          "when": "notebookType == 'jupyter-notebook' && notebookEditable && !aiNotebookLive.generating"
         }
       ],
       "commandPalette": [
         {
           "command": "aiNotebookLive.cancel",
           "when": "aiNotebookLive.generating"
+        },
+        {
+          "command": "aiNotebookLive.controlPanel"
         }
       ]
     },
@@ -293,5 +288,9 @@
       "supported": "limited",
       "description": "The Claude Code CLI provider and the local agent bridge both need a real filesystem."
     }
-  }
+  },
+  "bugs": {
+    "url": "https://github.com/brantgoe/ai-notebook-live/issues"
+  },
+  "homepage": "https://github.com/brantgoe/ai-notebook-live#readme"
 }

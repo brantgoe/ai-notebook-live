@@ -915,6 +915,34 @@ test('activate registers exactly the commands the manifest contributes', async (
     }
   }
   assert.ok(context.subscriptions.length >= contributed.length);
+
+  // Guardrails that used to be prose in a review instead of a test.
+  const props = manifest.contributes.configuration.properties;
+  for (const [key, spec] of Object.entries(props)) {
+    if (/execution|autoRun|claudePath|bridge\.(autoStart|port)/.test(key)) {
+      assert.strictEqual(
+        spec.scope,
+        'machine',
+        `${key} decides execution or opens a socket, so a workspace must not set it`
+      );
+    }
+  }
+  assert.ok(manifest.capabilities.untrustedWorkspaces, 'workspace trust must be declared');
+  assert.ok(
+    manifest.capabilities.untrustedWorkspaces.restrictedConfigurations.includes(
+      'aiNotebookLive.systemPromptExtra'
+    ),
+    'workspace-supplied prompt text must be restricted in an untrusted folder'
+  );
+  assert.ok(manifest.capabilities.virtualWorkspaces, 'virtual workspaces must be declared');
+  const macDefaults = ['cmd+alt+f'];
+  for (const binding of manifest.contributes.keybindings) {
+    assert.ok(
+      !macDefaults.includes(binding.mac),
+      `${binding.mac} is a VS Code default on macOS; do not bind over it`
+    );
+  }
+
   await extension.deactivate();
 });
 
