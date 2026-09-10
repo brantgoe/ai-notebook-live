@@ -299,7 +299,17 @@ function send(message) {
 }
 
 const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
-const fail = (id, message) => send({ jsonrpc: '2.0', id, error: { code: -32000, message } });
+const fail = (id, message, code = -32000) =>
+  send({ jsonrpc: '2.0', id, error: { code, message } });
+
+// The codes clients actually branch on. -32601 in particular is how a client
+// feature-detects an optional method (resources/*, prompts/*, logging/*);
+// answering -32000 tells it the server broke rather than that it does not do
+// that, which are different things.
+const PARSE_ERROR = -32700;
+const INVALID_REQUEST = -32600;
+const METHOD_NOT_FOUND = -32601;
+const INVALID_PARAMS = -32602;
 
 async function handle(msg) {
   const { id, method, params } = msg;
@@ -315,6 +325,20 @@ async function handle(msg) {
   }
   if (method === 'tools/list') return reply(id, { tools: TOOLS });
   if (method === 'tools/call') {
+    const name = params && params.name;
+    if (typeof name !== 'string') {
+      return fail(id, 'tools/call needs a params.name string', INVALID_PARAMS);
+    }
+    if (!TOOLS.some((t) => t.name === name)) {
+      // Checked BEFORE the bridge is contacted. callTool read the info file
+      // first, so calling a tool that does not exist reported "the AI Notebook
+      // bridge is not running" - a client could never tell a typo from a
+      // VS Code that was not ready.
+      return fail(id, `unknown tool: ${name}`, METHOD_NOT_FOUND);
+    }
+    if (params.arguments !== undefined && (typeof params.arguments !== 'object' || params.arguments === null || Array.isArray(params.arguments))) {
+      return fail(id, 'tools/call arguments must be an object', INVALID_PARAMS);
+    }
     try {
       const text = await callTool(params && params.name, (params && params.arguments) || {});
       return reply(id, { content: [{ type: 'text', text }] });
@@ -328,7 +352,7 @@ async function handle(msg) {
     }
   }
   if (method === 'ping') return reply(id, {});
-  return fail(id, `unknown method: ${method}`);
+  return fail(id, `unknown method: ${method}`, METHOD_NOT_FOUND);
 }
 
 function main() {
@@ -345,14 +369,34 @@ function main() {
       try {
         msg = JSON.parse(line);
       } catch {
-        continue; // a line we cannot parse is not ours to answer
+        // Silence here meant a client with an outstanding id waited forever -
+        // measured: a garbage line between two valid ones produced no frame at
+        // all. JSON-RPC says answer with -32700 and a null id.
+        fail(null, 'could not parse that line as JSON', PARSE_ERROR);
+        continue;
+      }
+      if (Array.isArray(msg)) {
+        // Batches are permitted by JSON-RPC 2.0 and this server does not do
+        // them. Saying so beats dropping them, which is what used to happen.
+        fail(null, 'batch requests are not supported; send one message per line', INVALID_REQUEST);
+        continue;
+      }
+      if (!msg || typeof msg !== 'object') {
+        fail(null, 'a JSON-RPC message must be an object', INVALID_REQUEST);
+        continue;
       }
       handle(msg).catch((err) => {
-        if (msg && msg.id !== undefined) fail(msg.id, String((err && err.message) || err));
+        if (msg.id !== undefined) fail(msg.id, String((err && err.message) || err));
       });
     }
   });
-  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('end', () => {
+    // process.exit() does not flush a pending pipe write: measured, 40 queued
+    // responses with a slow reader lost 24 of them. Let the write drain, and
+    // fall back to an exit code so a blocked pipe cannot hang the process.
+    process.exitCode = 0;
+    process.stdout.write('', () => process.exit(0));
+  });
 }
 
 if (require.main === module) main();

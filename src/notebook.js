@@ -486,8 +486,13 @@ async function runCell(notebook, index) {
       ranges: [{ start: index, end: index + 1 }],
       document: notebook.uri,
     });
+    return true;
   } catch (err) {
+    // Returned rather than only logged: the caller used to record "execution:
+    // ran" before knowing, so with no kernel the user answered "Run it" and
+    // nothing happened, while the log said otherwise.
     log('could not execute cell', index, '-', err && err.message);
+    return false;
   }
 }
 
@@ -511,8 +516,7 @@ async function runApproved(notebook, index, approved) {
   const cell = notebook.cellAt(index);
   if (!cell) return false;
   if (typeof approved === 'string' && cell.document.getText() !== approved) return false;
-  await runCell(notebook, index);
-  return true;
+  return runCell(notebook, index);
 }
 
 /**

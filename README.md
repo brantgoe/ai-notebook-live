@@ -56,7 +56,7 @@ Releases and reload.
 ## Setup
 
 Open the **control panel** — `Ctrl+Shift+P` → `AI Notebook: Control Panel`, or
-click the `$(sparkle) AI` item in the status bar. It tells you which provider it
+click the ✨ **AI** item in the status bar. It tells you which provider it
 found and what will happen when a cell finishes.
 
 Two ways to reach a model:
@@ -88,7 +88,11 @@ error message offers to do it for you.
 | Copy Agent Bridge Example Command | — | A ready-to-run command, with no token in it |
 | Show Log | — | What was sent where, and why a cell did or did not run |
 
-*Revise*, *Fix* and *Explain* are also on the cell toolbar.
+*Revise* and *Explain* are also on the cell toolbar; *Fix the Error* appears
+there once the cell has been run and has an error to fix.
+
+**Don't like what it wrote? `Ctrl+Z`.** Everything the extension does to a cell
+is an ordinary undoable edit.
 
 ## Whether generated code runs
 
@@ -100,7 +104,10 @@ one. Set it in the control panel, or directly:
 | `aiNotebookLive.execution` | `ask` | Cells **you** asked Claude for |
 | `aiNotebookLive.bridge.execution` | `never` | Cells **another program** pushed in |
 
-Each is `never`, `ask` or `always`. `ask` shows the code and waits for you.
+Each is `never`, `ask` or `always`. `ask` shows the code and waits for you —
+except on the bridge, where the HTTP caller is answered immediately (`pending`)
+and the prompt appears afterwards, so an agent-pushed cell can run a few seconds
+after it arrives. Nothing runs without you clicking.
 
 An agent using the bridge may ask for its cell to be run, but cannot demand it:
 a request can only ever lower this decision, never raise it. Nothing executes in
@@ -176,7 +183,8 @@ does not match. `413` for a body over 1 MiB.
 
 ## Letting other AI tools write here
 
-The bridge is also exposed as an **MCP server**, so a tool that speaks MCP can
+The bridge is also exposed as an **MCP server** (Model Context Protocol — the
+standard way an AI tool is told what actions it may take), so a tool that speaks it can
 add cells to your open notebook as a first-class action rather than by being
 told to run a shell command.
 
@@ -213,6 +221,9 @@ to `never` — an agent can ask, and never override you.
   server refuses, so a web page cannot reach the bridge. A token in a query
   string would remove that protection and would land in shell history.
 - Requests carrying an `Origin`, or a `Host` that is not loopback, are refused.
+**Short version:** only programs already running on your own computer can reach
+this. A web page cannot, and it is off until you turn it on.
+
 - The token file is created `0600` in a `0700` directory, with `O_EXCL` so it
   will not follow a symlink.
 - Copyable commands never contain the token.
@@ -244,7 +255,15 @@ of inventing them, and *Fix the Error* depends on it — but you can turn it off
 in the control panel or with `includeOutputs`.
 
 With the **API** provider this goes to Anthropic under your API key. With the
-**Claude Code CLI** provider it goes through your existing Claude Code session.
+**Claude Code CLI** provider it goes through your existing Claude Code session —
+and note that the CLI is started *inside your workspace folder*, so Claude Code
+sees that folder path as its working directory even though the prompt itself
+carries only the file name.
+
+If `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is exported in your shell, the
+`auto` provider uses it in preference to your Claude Code plan, and that is
+billed per token. Set `provider` to `claude-cli` if you would rather it never
+did.
 
 **This extension collects no telemetry of its own.** Nothing is sent anywhere
 except the provider you chose, for a request you triggered.
@@ -273,7 +292,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 111 tests, no VS Code needed
+npm test          # 113 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

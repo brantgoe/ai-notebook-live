@@ -266,6 +266,12 @@ function streamCli({ system, user, opts, token, onText, binary }) {
   log('spawning', bin, 'with model', opts.model);
 
   return new Promise((resolve, reject) => {
+    // Declared up here because the cancellation handler below is created BEFORE
+    // the old `let escalate` and assigns to it. That was safe only because
+    // VS Code happens to dispatch an already-cancelled token via setTimeout
+    // rather than synchronously - an undocumented detail holding off a TDZ
+    // ReferenceError.
+    let escalate;
     let cwd;
     try {
       if (opts.cwd && fs.statSync(opts.cwd).isDirectory()) cwd = opts.cwd;
@@ -303,7 +309,6 @@ function streamCli({ system, user, opts, token, onText, binary }) {
     // is what the whole-turn fallback below keys off. This one only says
     // whether the caller ever received any text at all.
     let producedText = false;
-    let escalate;
     let model = opts.model;
 
     const handle = (line) => {

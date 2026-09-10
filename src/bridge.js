@@ -47,7 +47,11 @@ function defaultInfoDir() {
  * Requests must carry the token written to ~/.ai-notebook-live/bridge.json.
  */
 class Bridge {
-  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks, notify }) {
+  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks, notify, version }) {
+    // Injected rather than required from package.json: requiring it here makes
+    // esbuild inline the WHOLE manifest - devDependencies, scripts and all -
+    // into the shipped bundle, which grew it by 16 KB of build detail.
+    this.version = version || '0.0.0';
     this.resolveNotebook = resolveNotebook;
     this.listNotebooks = listNotebooks;
     // This module deliberately does not import vscode - it is the one piece
@@ -263,6 +267,11 @@ class Bridge {
         ok: true,
         notebook: notebook ? notebook.uri.fsPath : null,
         cells: notebook ? notebook.cellCount : 0,
+        // So a client can tell an old host from a broken one. There was no way
+        // to: a 0.5.0 client asking a 0.4.0 bridge for /cells got "use POST",
+        // which says nothing about the endpoint being absent.
+        version: this.version,
+        supports: ['cells', 'replace', 'expect', 'stream'],
       });
     }
     if (!this.authorized(req)) return send(res, 401, { error: 'bad or missing token' });
@@ -274,7 +283,16 @@ class Bridge {
       return send(res, 200, this.readCells(url.searchParams));
     }
 
-    if (req.method !== 'POST') return send(res, 405, { error: 'use POST' });
+    const KNOWN = ['/health', '/cells', '/cell', '/cell/replace', '/cell/stream'];
+    if (!KNOWN.includes(url.pathname)) {
+      return send(res, 404, { error: `unknown path: ${url.pathname}` });
+    }
+    if (req.method !== 'POST') {
+      // Allow, per RFC 9110 - and a 405 now means "wrong method for a path I
+      // have", never "I have never heard of that path".
+      res.setHeader('allow', url.pathname === '/cells' || url.pathname === '/health' ? 'GET' : 'POST');
+      return send(res, 405, { error: `use POST for ${url.pathname}` });
+    }
 
     if (url.pathname === '/cell') {
       const body = await readJson(req);
@@ -409,10 +427,17 @@ class Bridge {
       if (!writer) {
         return send(res, 400, { error: 'nothing to insert: the request body was empty' });
       }
-      return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+      try {
+        return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+      } catch (err) {
+        // /cell wraps this and /cell/stream did not, so a failure in the final
+        // write left the half-written cell sitting in the notebook.
+        await writer.abandon();
+        throw err;
+      }
     }
 
-    return send(res, 404, { error: 'unknown path' });
+    return send(res, 404, { error: `unknown path: ${url.pathname}` });
   }
 
   /**

@@ -46,6 +46,7 @@ function activate(context) {
         .filter((d) => !d.isClosed)
         .map((d) => path.basename(d.uri.fsPath)),
     decideRun: (req) => decideExecution({ ...req, intent: 'bridge', opts: settings() }),
+    version: context.extension ? context.extension.packageJSON.version : undefined,
     // The bridge has no vscode of its own, so anything the user needs to see -
     // a cell an agent overwrote, an approval that no longer matched - comes back
     // out through here.
@@ -153,7 +154,17 @@ function activate(context) {
   resolveProvider(settings(), context.secrets).catch(() => {});
 
   if (settings().bridgeAutoStart) startBridge(false);
-  log('activated');
+  // Everything a remote diagnosis otherwise costs three round-trips to
+  // establish. This is the highest return per line in the file: a user pastes
+  // their output channel and the first question is already answered.
+  const manifest = context.extension && context.extension.packageJSON;
+  log(
+    `activated v${(manifest && manifest.version) || '?'}`,
+    `vscode=${vscode.version}`,
+    `node=${process.versions.node}`,
+    `platform=${process.platform}`,
+    `trusted=${vscode.workspace.isTrusted !== false}`
+  );
 }
 
 async function deactivate() {
@@ -335,14 +346,18 @@ async function copyAgentSetup() {
   const server = state.context.asAbsolutePath(path.join('bin', 'mcp-server.js'));
   const line = `codex mcp add ai-notebook -- node ${JSON.stringify(server)}`;
   const pick = await vscode.window.showInformationMessage(
-    'Register this notebook with an AI tool that speaks MCP, so it can add cells here directly.',
+    'Let another AI tool — Codex, for example — read and write this notebook while you have it ' +
+      'open. Copy the one-line command, run it in a terminal, then restart that tool. ' +
+      'The path changes when this extension updates, so re-run it after an upgrade.',
     'Copy command for Codex',
     'Show the path'
   );
   if (pick === 'Copy command for Codex') {
     await vscode.env.clipboard.writeText(line);
     vscode.window.showInformationMessage(
-      'Copied. Run it in a terminal, then restart Codex. Start the bridge before asking it to write.'
+      'Copied. Run it in a terminal, then restart Codex, and start the bridge before asking it to ' +
+        'write. Gate the destructive tool while you are there: `codex mcp approve ' +
+        'ai-notebook replace_notebook_cell` — it is the one that overwrites a cell.'
     );
   }
   if (pick === 'Show the path') {
@@ -517,12 +532,30 @@ async function startBridge(announce) {
       if (pick === 'Show Log') showLog();
     }
   } catch (err) {
-    await reportError(
-      new Error(
-        `could not start the agent bridge on port ${settings().bridgePort}: ${(err && err.message) || err}`
-      )
-    );
+    const port = settings().bridgePort;
+    const message = (err && err.message) || String(err);
+    // The overwhelmingly likely cause is a second VS Code window already
+    // holding the port, and the product already has the fix - the message just
+    // never mentioned it, so the only option offered was "Show Log".
+    if (/EADDRINUSE/.test(message) && port !== 0) {
+      const pick = await vscode.window.showWarningMessage(
+        `AI Notebook Live: port ${port} is already in use — another VS Code window may already have ` +
+          'the bridge running.',
+        'Use any free port',
+        'Show Log'
+      );
+      if (pick === 'Use any free port') {
+        await vscode.workspace
+          .getConfiguration('aiNotebookLive')
+          .update('bridge.port', 0, vscode.ConfigurationTarget.Global);
+        return startBridge(true);
+      }
+      if (pick === 'Show Log') showLog();
+      return undefined;
+    }
+    await reportError(new Error(`could not start the agent bridge on port ${port}: ${message}`));
   }
+  return undefined;
 }
 
 function rememberNotebook(editor) {
@@ -865,7 +898,11 @@ async function pump({ writer, system, user, opts, token, target, intent, request
       // Checked against what was approved, not just which cell: a bridge caller
       // can rewrite the cell while an 'ask' dialog is open.
       if (decision.run && !(await runApproved(writer.notebook, writer.index, text))) {
-        log(`execution declined: cell ${writer.index} changed before it could run`);
+        log(`execution did not happen: cell ${writer.index} changed, or the kernel refused`);
+        vscode.window.showWarningMessage(
+          'AI Notebook Live: the cell was written but not run. Either it changed before it could ' +
+            'run, or no kernel is attached — run it yourself with Shift+Enter.'
+        );
       }
     }
 

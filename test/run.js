@@ -1142,6 +1142,66 @@ test('a clipped cell says so on the cell itself, not once for the response', asy
   }
 });
 
+test('a malformed frame is answered, not silently dropped', async () => {
+  // Measured: a garbage line between two valid ones produced NO frame at all,
+  // so a client with an outstanding id waited forever. Batch arrays vanished
+  // the same way. JSON-RPC says answer -32700 with a null id.
+  const mcp = require(path.join('..', 'bin', 'mcp-server.js'));
+  const sent = [];
+  const realWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    sent.push(String(chunk));
+    return true;
+  };
+  try {
+    // handle() only sees parsed objects, so exercise the codes it owns.
+    await mcp.handle({ jsonrpc: '2.0', id: 3, method: 'resources/list' });
+    await mcp.handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'no_such_tool' } });
+    await mcp.handle({ jsonrpc: '2.0', id: 5, method: 'tools/call' });
+  } finally {
+    process.stdout.write = realWrite;
+  }
+  const frames = sent.join('').trim().split('\n').map((l) => JSON.parse(l));
+  assert.strictEqual(frames.length, 3, 'every request with an id gets exactly one answer');
+  // -32601 is how a client feature-detects an optional method; -32000 tells it
+  // the server broke instead, which is a different thing.
+  assert.strictEqual(frames[0].error.code, -32601, 'unknown method');
+  assert.strictEqual(frames[1].error.code, -32601, 'unknown tool, checked before the bridge');
+  assert.ok(
+    !/bridge is not running/.test(frames[1].error.message),
+    'a typo must not be reported as VS Code not being ready'
+  );
+  assert.strictEqual(frames[2].error.code, -32602, 'missing params.name');
+});
+
+test('the bridge says which version it is and what it can do', async () => {
+  // There was no way to tell an old host from a broken one: a 0.5.0 client
+  // asking a 0.4.0 bridge for /cells got "use POST", which says nothing about
+  // the endpoint being absent.
+  const notebook = newNotebook(['x = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+    version: '9.9.9',
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const health = JSON.parse((await call(port, token, { method: 'GET', path: '/health' })).body);
+    assert.strictEqual(health.version, '9.9.9');
+    assert.ok(health.supports.includes('replace'), 'and which verbs it has');
+
+    // Path first, then method: an unknown path is a 404, and a 405 now means
+    // "wrong method for a path I have" rather than "never heard of it".
+    const gone = await call(port, token, { method: 'GET', path: '/nope' });
+    assert.strictEqual(gone.status, 404);
+    const wrongMethod = await call(port, token, { method: 'GET', path: '/cell' });
+    assert.strictEqual(wrongMethod.status, 405);
+  } finally {
+    await bridge.stop();
+  }
+});
+
 test('the MCP server speaks enough of the protocol to be driven', async () => {
   const sent = [];
   const realWrite = process.stdout.write;
