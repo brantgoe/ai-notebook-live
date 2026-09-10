@@ -295,6 +295,21 @@ async function main() {
     return process.exit(res.status === 200 ? 0 : 1);
   }
 
+  if (args.list) {
+    const res = await request(info, { method: 'GET', pathname: '/cells' });
+    if (res.status !== 200) {
+      process.stderr.write(`nbpush: ${res.status} ${res.text}\n`);
+      return process.exit(1);
+    }
+    const d = JSON.parse(res.text);
+    process.stderr.write(`nbpush: ${d.notebook} - ${d.count} cells\n`);
+    for (const c of d.cells) {
+      const first = (c.source.split('\n')[0] || '').slice(0, 68);
+      process.stdout.write(`${String(c.index).padStart(3)} [${c.kind[0]}] ${first}\n`);
+    }
+    return undefined;
+  }
+
   const input = chooseInput(args);
   if (input.kind === 'refuse') {
     process.stderr.write(`nbpush: ${input.message}\n`);
@@ -324,8 +339,8 @@ async function main() {
     const code = input.kind === 'literal' ? input.code : fs.readFileSync(input.file, 'utf8');
     res = await request(info, {
       method: 'POST',
-      pathname: '/cell',
-      search: search.toString(),
+      pathname: args.replace !== undefined ? '/cell/replace' : '/cell',
+      search: args.replace !== undefined ? `index=${encodeURIComponent(args.replace)}` : search.toString(),
       body: JSON.stringify({ code }),
     });
   } else {

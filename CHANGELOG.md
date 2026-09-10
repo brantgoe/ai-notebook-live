@@ -7,6 +7,26 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.5.0] — 2026-09-09
+
+### Added
+
+- **Reading the notebook, live.** `GET /cells`, the `get_notebook_cells` MCP
+  tool, and `nbpush --list` return what the editor actually holds, **including
+  unsaved edits**. The bridge was write-only, which meant an agent could add a
+  cell and then never look at it — and a reviewer had to ask you to save before
+  they could see anything.
+- **Rewriting a cell in place.** `POST /cell/replace?index=N`, the
+  `replace_notebook_cell` MCP tool, and `nbpush --replace <index>`. Without it,
+  an agent correcting a mistake could only append a second, fixed copy and leave
+  the wrong one behind.
+
+  Kept deliberately separate from adding a cell: appending is additive and
+  forgiving, replacing destroys what was there. It must be asked for by name and
+  by index, it refuses an index that does not exist rather than inventing a cell,
+  and it returns the previous contents so the loss is visible rather than silent.
+  `Ctrl+Z` still restores it.
+
 ## [0.4.0] — 2026-09-09
 
 ### Added

@@ -734,7 +734,12 @@ const mcp = require(path.join('..', 'bin', 'mcp-server.js'));
 
 test('the MCP server describes tools an agent can actually use', () => {
   const names = mcp.TOOLS.map((t) => t.name).sort();
-  assert.deepStrictEqual(names, ['add_notebook_cell', 'get_notebook_status']);
+  assert.deepStrictEqual(names, [
+    'add_notebook_cell',
+    'get_notebook_cells',
+    'get_notebook_status',
+    'replace_notebook_cell',
+  ]);
   for (const tool of mcp.TOOLS) {
     assert.ok(tool.description.length > 40, `${tool.name} needs a description worth reading`);
     assert.strictEqual(tool.inputSchema.type, 'object');
@@ -744,6 +749,61 @@ test('the MCP server describes tools an agent can actually use', () => {
   // The description has to say WHY, not just what: an agent that edits the
   // .ipynb on disk instead will silently lose the user's work.
   assert.match(add.description, /already open|on disk/i);
+
+  // The read tool has to say why reading the file is wrong, or an agent will
+  // just open the .ipynb and get a stale copy.
+  const read = mcp.TOOLS.find((t) => t.name === 'get_notebook_cells');
+  assert.match(read.description, /unsaved|stale/i);
+
+  // And the destructive one has to say that it destroys.
+  const replace = mcp.TOOLS.find((t) => t.name === 'replace_notebook_cell');
+  assert.match(replace.description, /destroys|DESTROYS/);
+  assert.deepStrictEqual(replace.inputSchema.required.sort(), ['code', 'index']);
+});
+
+test('reading and replacing go through the bridge, live', async () => {
+  const notebook = newNotebook(['a = 1', 'print("$3 wrong $$5.00")']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const listed = await call(port, token, { method: 'GET', path: '/cells' });
+    assert.strictEqual(listed.status, 200);
+    const d = JSON.parse(listed.body);
+    assert.strictEqual(d.count, 2);
+    assert.strictEqual(d.cells[0].source, 'a = 1');
+    assert.strictEqual(d.cells[1].kind, 'code');
+
+    const ranged = await call(port, token, { method: 'GET', path: '/cells?from=1&to=2' });
+    assert.strictEqual(JSON.parse(ranged.body).cells.length, 1);
+    const bad = await call(port, token, { method: 'GET', path: '/cells?from=abc' });
+    assert.strictEqual(bad.status, 400);
+
+    // Replacing must rewrite in place and hand back what it destroyed, so a
+    // mistake is visible rather than silent.
+    const fixed = 'print(f"{3} items cost ${5.0:.2f}")';
+    const rep = await call(port, token, {
+      path: '/cell/replace?index=1',
+      body: JSON.stringify({ code: fixed }),
+    });
+    assert.strictEqual(rep.status, 200);
+    assert.strictEqual(JSON.parse(rep.body).replaced, 'print("$3 wrong $$5.00")');
+    assert.strictEqual(notebook.cellAt(1).document.getText(), fixed);
+    assert.strictEqual(notebook.cellCount, 2, 'replacing must not add a cell');
+
+    // An index that does not exist is the caller's mistake, not a new cell.
+    const off = await call(port, token, {
+      path: '/cell/replace?index=99',
+      body: JSON.stringify({ code: 'x = 1' }),
+    });
+    assert.strictEqual(off.status, 400);
+    assert.strictEqual(notebook.cellCount, 2);
+  } finally {
+    await bridge.stop();
+  }
 });
 
 test('the MCP server speaks enough of the protocol to be driven', async () => {
@@ -767,7 +827,7 @@ test('the MCP server speaks enough of the protocol to be driven', async () => {
   assert.strictEqual(init.protocolVersion, '2024-11-05');
   assert.ok(init.capabilities.tools, 'it must advertise tools');
   assert.strictEqual(init.serverInfo.name, 'ai-notebook-live');
-  assert.strictEqual(JSON.parse(sent[1]).result.tools.length, 2);
+  assert.strictEqual(JSON.parse(sent[1]).result.tools.length, mcp.TOOLS.length);
 });
 
 test('an MCP tool failure comes back as a result the model can read', async () => {

@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { CellWriter, editorFor, runCell } = require('./notebook');
+const { CellWriter, editorFor, runCell, readOutputs, cellKindName } = require('./notebook');
 const validate = require('./validate');
 const { log } = require('./log');
 
@@ -217,6 +217,14 @@ class Bridge {
       });
     }
     if (!this.authorized(req)) return send(res, 401, { error: 'bad or missing token' });
+
+    // Reading is routed before the POST-only gate. An agent that can add a cell
+    // but never look at one cannot check its own work, or see what the user
+    // changed afterwards.
+    if (req.method === 'GET' && url.pathname === '/cells') {
+      return send(res, 200, this.readCells(url.searchParams));
+    }
+
     if (req.method !== 'POST') return send(res, 405, { error: 'use POST' });
 
     if (url.pathname === '/cell') {
@@ -235,6 +243,46 @@ class Bridge {
       try {
         writer.write(code);
         return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+      } catch (err) {
+        await writer.abandon();
+        throw err;
+      }
+    }
+
+    if (url.pathname === '/cell/replace') {
+      // Rewriting an existing cell, as opposed to adding one. Deliberately
+      // separate from /cell: appending is additive and forgiving, replacing
+      // destroys what was there, so it must be asked for by name and by index.
+      const body = await readJson(req);
+      const raw = typeof body.code === 'string' ? body.code : body.text;
+      if (typeof raw !== 'string') {
+        return send(res, 400, { error: 'body needs a "code" string' });
+      }
+      const code = validate.cellText(raw);
+      const notebook = this.resolveNotebook(url.searchParams.get('notebook'));
+      if (!notebook) throw new BridgeError('no notebook is open in VS Code', 409);
+      const at = Number(url.searchParams.get('index'));
+      if (!Number.isInteger(at) || at < 0 || at >= notebook.cellCount) {
+        throw new BridgeError(
+          `index must be a cell that exists: 0..${notebook.cellCount - 1}`,
+          400
+        );
+      }
+      const cell = notebook.cellAt(at);
+      // Handed back so the caller - and the user reading a log - can see what
+      // was destroyed. Ctrl+Z also restores it, but only if somebody noticed.
+      const previous = cell.document.getText();
+      const writer = await CellWriter.replace(notebook, cell);
+      try {
+        writer.write(code);
+        const text = await writer.end();
+        return send(res, 200, {
+          ok: true,
+          notebook: notebook.uri.fsPath,
+          index: at,
+          characters: text.length,
+          replaced: previous,
+        });
       } catch (err) {
         await writer.abandon();
         throw err;
@@ -278,6 +326,59 @@ class Bridge {
     }
 
     return send(res, 404, { error: 'unknown path' });
+  }
+
+  /**
+   * The live contents of the open notebook.
+   *
+   * Reads the document VS Code has in memory, so it reflects unsaved edits -
+   * which is the whole point, since the file on disk can be arbitrarily out of
+   * date while a tab is open.
+   */
+  readCells(search) {
+    const hint = search.get('notebook');
+    const notebook = this.resolveNotebook(hint);
+    if (!notebook) {
+      throw new BridgeError(
+        hint ? `no open notebook matches ${JSON.stringify(hint)}` : 'no notebook is open in VS Code',
+        409
+      );
+    }
+    const all = notebook.getCells();
+    const from = clampIndex(search.get('from'), 0, all.length);
+    const to = clampIndex(search.get('to'), all.length, all.length);
+    const wantOutputs = search.get('outputs') === '1';
+    // A notebook can be far larger than anything worth sending in one response,
+    // so each cell is clipped and the caller is told when that happened.
+    const LIMIT = 4000;
+    let truncated = false;
+
+    const cells = all.slice(from, Math.max(from, to)).map((cell) => {
+      const text = cell.document.getText();
+      const clipped = text.length > LIMIT;
+      if (clipped) truncated = true;
+      const out = {
+        index: cell.index,
+        kind: cellKindName(cell),
+        language: cell.document.languageId,
+        source: clipped ? `${text.slice(0, LIMIT)}\n...<truncated>` : text,
+      };
+      if (wantOutputs) {
+        const seen = readOutputs(cell);
+        if (seen.error) out.error = seen.error;
+        if (seen.text) out.output = seen.text;
+      }
+      return out;
+    });
+
+    return {
+      ok: true,
+      notebook: notebook.uri.fsPath,
+      count: all.length,
+      from,
+      cells,
+      truncated,
+    };
   }
 
   async openWriter(options) {
@@ -350,6 +451,16 @@ class Bridge {
       reason: decision.reason,
     };
   }
+}
+
+/** A whole-number index inside the notebook, or a stated default. */
+function clampIndex(raw, fallback, count) {
+  if (raw === null || raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) {
+    throw new BridgeError(`from/to must be whole numbers, not ${JSON.stringify(String(raw))}`, 400);
+  }
+  return Math.min(Math.max(0, n), count);
 }
 
 function send(res, status, body) {

@@ -106,6 +106,11 @@ async function apply(edit, what) {
   }
 }
 
+/** 'markdown' or 'code', without every caller needing the vscode enum. */
+function cellKindName(cell) {
+  return cell.kind === vscode.NotebookCellKind.Markup ? 'markdown' : 'code';
+}
+
 function editorFor(notebook) {
   return vscode.window.visibleNotebookEditors.find((e) => e.notebook === notebook);
 }
@@ -455,4 +460,12 @@ function readOutputs(cell, { limit = 1200 } = {}) {
   };
 }
 
-module.exports = { CellWriter, runCell, readOutputs, notebookLanguage, editorFor, unfence };
+module.exports = {
+  CellWriter,
+  runCell,
+  readOutputs,
+  notebookLanguage,
+  editorFor,
+  cellKindName,
+  unfence,
+};

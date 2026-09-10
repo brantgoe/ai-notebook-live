@@ -29,7 +29,7 @@ needs VS Code's `NotebookEdit` API, which is what this extension uses.
 
 1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
 2. ```bash
-   code --install-extension ai-notebook-live-0.4.0.vsix
+   code --install-extension ai-notebook-live-0.5.0.vsix
    ```
 3. Reload the window.
 
@@ -134,9 +134,11 @@ printf 'print("hello from an agent")' | node bin/nbpush.js
 Command` gives you a working command for your machine.
 
 ```
-GET  /health        state of the target notebook
-POST /cell          {"code": "..."} in one shot
-POST /cell/stream   raw body, streamed into the cell as it arrives
+GET  /health         state of the target notebook
+GET  /cells          the live contents, including unsaved edits
+POST /cell           {"code": "..."} in one shot
+POST /cell/replace   rewrite one existing cell, by ?index=
+POST /cell/stream    raw body, streamed into the cell as it arrives
 ```
 
 Query parameters — and only the query string: `kind=code|markdown`,
@@ -173,7 +175,9 @@ Then restart Codex. It gets two tools:
 | tool | what it does |
 |---|---|
 | `get_notebook_status` | which notebook is targeted, and how many cells it has |
+| `get_notebook_cells` | reads the live contents, **including unsaved edits** — the file on disk can be arbitrarily stale |
 | `add_notebook_cell` | adds a cell, live — `code`/`markdown`, a position, and an optional request to run it |
+| `replace_notebook_cell` | rewrites one existing cell by index, so an agent can correct its own work instead of appending a second copy |
 
 Start the bridge before asking Codex to write. Whether an agent-written cell
 *executes* is still governed by `aiNotebookLive.bridge.execution`, which defaults
@@ -245,7 +249,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 79 tests, no VS Code needed
+npm test          # 80 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

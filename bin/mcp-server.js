@@ -142,6 +142,41 @@ const TOOLS = [
     },
   },
   {
+    name: 'get_notebook_cells',
+    description:
+      'Read the cells of the notebook open in VS Code, including unsaved edits. ' +
+      'Use this to check your own work after adding a cell, to see what the user changed, ' +
+      'and to find the index of a cell you want to replace. Reading the .ipynb file instead ' +
+      'gives you a stale copy, because the editor holds changes that are not on disk.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'number', description: 'First cell index to return. Defaults to 0.' },
+        to: { type: 'number', description: 'Stop before this index. Defaults to the end.' },
+        outputs: {
+          type: 'boolean',
+          description: 'Include each cell’s output and any error it produced. Off by default.',
+        },
+      },
+    },
+  },
+  {
+    name: 'replace_notebook_cell',
+    description:
+      'Rewrite the contents of one existing cell, in place, by index. Use this to correct a ' +
+      'cell you added — appending a second, fixed copy leaves the wrong one behind. ' +
+      'This DESTROYS what was there, so read the cell first and be sure of the index; the ' +
+      'previous contents come back in the response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        index: { type: 'number', description: 'The index of the cell to rewrite.' },
+        code: { type: 'string', description: 'The new contents of the cell.' },
+      },
+      required: ['index', 'code'],
+    },
+  },
+  {
     name: 'get_notebook_status',
     description:
       'Report which notebook the bridge is currently targeting and how many cells it has. ' +
@@ -156,6 +191,48 @@ async function callTool(name, args) {
 
   if (name === 'get_notebook_status') {
     return `Bridge is live on 127.0.0.1:${info.port}.\nNotebook: ${health.notebook}\nCells: ${health.cells}`;
+  }
+
+  if (name === 'get_notebook_cells') {
+    const search = new URLSearchParams();
+    if (args.from !== undefined) search.set('from', String(args.from));
+    if (args.to !== undefined) search.set('to', String(args.to));
+    if (args.outputs) search.set('outputs', '1');
+    const res = await request(info, {
+      method: 'GET',
+      pathname: '/cells',
+      search: search.toString(),
+    });
+    if (res.status !== 200) throw new Error(`could not read the notebook (${res.status}): ${res.text}`);
+    const d = JSON.parse(res.text);
+    const body = d.cells
+      .map((c) => `--- cell ${c.index} (${c.kind}) ---\n${c.source}` +
+        (c.error ? `\n[error] ${c.error}` : '') +
+        (c.output ? `\n[output] ${c.output}` : ''))
+      .join('\n\n');
+    return (
+      `${d.notebook} has ${d.count} cells; showing ${d.cells.length} from index ${d.from}.` +
+      (d.truncated ? ' Some cells were clipped.' : '') +
+      `\n\n${body}`
+    );
+  }
+
+  if (name === 'replace_notebook_cell') {
+    if (!Number.isInteger(args.index)) throw new Error('index must be a whole number');
+    if (typeof args.code !== 'string' || !args.code.trim()) {
+      throw new Error('code is required and must be a non-empty string');
+    }
+    const res = await request(info, {
+      pathname: '/cell/replace',
+      search: `index=${encodeURIComponent(args.index)}`,
+      body: JSON.stringify({ code: args.code }),
+    });
+    if (res.status !== 200) throw new Error(`the bridge refused this edit (${res.status}): ${res.text}`);
+    const out = JSON.parse(res.text);
+    return (
+      `Rewrote cell ${out.index} of ${out.notebook}.\n` +
+      `It previously contained:\n${out.replaced}`
+    );
   }
 
   if (name !== 'add_notebook_cell') throw new Error(`unknown tool: ${name}`);
