@@ -2,7 +2,7 @@
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
   "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let external AI agents push cells in live over a localhost bridge.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {
@@ -259,6 +259,14 @@
             "Run cells pushed in by local agents automatically."
           ],
           "description": "Whether code pushed in by an external agent over the local bridge may run in your kernel."
+        },
+        "aiNotebookLive.timeoutSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 30,
+          "maximum": 3600,
+          "scope": "window",
+          "markdownDescription": "Give up on a generation after this many seconds with **no output at all**. Measured from the last token, not from the start, so a model that thinks for a long time is not interrupted. Raise it if you use a slow local setup."
         }
       }
     }

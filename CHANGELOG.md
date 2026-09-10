@@ -7,6 +7,37 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.3.2] — 2026-09-09
+
+A second round of adversarial testing, aimed at the `claude` CLI provider, which
+had no test coverage at all. Three findings, all of them the same shape: the
+extension had the information needed to explain itself and threw it away.
+
+### Fixed
+
+- **A generation that stalls now gives up on its own.** If the provider stopped
+  responding entirely, nothing ever timed out — and the damage was worse than a
+  hung request: the extension stayed convinced it was still writing, so **every
+  later command was refused with "already writing a cell" until you reloaded
+  the window**. It now stops after five minutes of silence, keeps whatever was
+  written, and says so. The window is measured from the last token rather than
+  from the start, so a model that thinks for a long time is not interrupted,
+  and it is configurable with `aiNotebookLive.timeoutSeconds`.
+- **A CLI failure that exits successfully is no longer silent.** The `claude`
+  CLI reports some problems in its output stream and still exits 0 —
+  `error_max_turns` is the common one. The reason was captured and then only
+  ever shown if the exit code was non-zero, so you got an empty cell and no
+  explanation. A genuinely empty result still stays quiet.
+- **An unusual cell output no longer breaks *Fix the Error*.** Reading a cell's
+  outputs assumed every item had both a type and data; one that did not threw a
+  TypeError, which surfaced as a confusing error dialog instead of a fix.
+
+### Internal
+
+- 76 tests, up from 72. The CLI provider is now driven by a stand-in binary
+  emitting crafted output, covering an in-band failure, a quiet success and a
+  process that never exits.
+
 ## [0.3.1] — 2026-09-09
 
 Two items filed as rough edges in the 0.2.0 review turned out to be neither.

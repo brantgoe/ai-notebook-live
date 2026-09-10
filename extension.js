@@ -556,21 +556,70 @@ function workingDirFor(notebook) {
   return notebook.uri.scheme === 'file' ? path.dirname(notebook.uri.fsPath) : undefined;
 }
 
+/**
+ * Explains why a generation stopped. A timeout and a deliberate cancel both
+ * arrive here as `cancelled`, but they mean opposite things to the user: one
+ * they did, the other happened to them.
+ */
+function reportStop(gaveUp, silence) {
+  if (!gaveUp) {
+    vscode.window.setStatusBarMessage('$(stop-circle) AI generation cancelled', 2500);
+    return;
+  }
+  vscode.window
+    .showWarningMessage(
+      `AI Notebook Live: no output for ${Math.round(silence / 1000)}s, so it gave up. ` +
+        'Anything already written was kept.',
+      'Show Log'
+    )
+    .then((pick) => {
+      if (pick === 'Show Log') showLog();
+    });
+}
+
 /** Runs one streaming request and lands every token in the cell as it arrives. */
 async function pump({ writer, system, user, opts, token, target, intent, requested }) {
   const started = Date.now();
   opts = { ...opts, cwd: workingDirFor(writer.notebook) };
+  // A provider that never settles used to wedge the extension permanently:
+  // guard()'s finally never ran, state.active was never cleared, and every
+  // later command was refused with "already writing a cell" for the life of
+  // the window. The timer lives here rather than in the provider because
+  // onText is already threaded through both of them, so one timer covers the
+  // API and the CLI alike.
+  //
+  // It measures SILENCE, not elapsed time: a model can think for minutes
+  // without emitting a token, and interrupting that would be wrong.
+  const silence = Math.max(30, Number(opts.timeoutSeconds) || 300) * 1000;
+  let idle;
+  let gaveUp = false;
+  const restartIdleTimer = () => {
+    if (idle) clearTimeout(idle);
+    idle = setTimeout(() => {
+      gaveUp = true;
+      log(`no output for ${silence / 1000}s; giving up`);
+      // Cancelling rather than killing: the cancellation path already stops the
+      // child, settles the promise and keeps whatever text arrived.
+      if (state.active) state.active.cancel();
+    }, silence);
+  };
+
   let result;
   try {
+    restartIdleTimer();
     result = await stream({
       target,
       system,
       user,
       opts,
       token,
-      onText: (chunk) => writer.write(chunk),
+      onText: (chunk) => {
+        restartIdleTimer();
+        writer.write(chunk);
+      },
     });
   } catch (err) {
+    if (idle) clearTimeout(idle);
     // The writer knows what undoing itself means: delete a cell we created,
     // hand back a cell we borrowed. pump no longer has to be told.
     const { partial } = await writer.abandon();
@@ -621,7 +670,7 @@ async function pump({ writer, system, user, opts, token, target, intent, request
   );
 
   if (result.cancelled || (token && token.isCancellationRequested)) {
-    vscode.window.setStatusBarMessage('$(stop-circle) AI generation cancelled', 2500);
+    reportStop(gaveUp, silence);
     return;
   }
   if (result.refused) {

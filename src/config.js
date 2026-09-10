@@ -58,6 +58,7 @@ function settings() {
     // the restrictedConfigurations declaration in package.json.
     systemPromptExtra: String(c.get('systemPromptExtra', '') || '').slice(0, 2000),
     refusalFallback: c.get('refusalFallback', true) !== false,
+    timeoutSeconds: inRangeOr(c.get('timeoutSeconds', 300), 30, 3600, 300),
     bridgeAutoStart: c.get('bridge.autoStart', false) === true,
     bridgePort: (() => {
       const raw = Number(c.get('bridge.port', 37417));

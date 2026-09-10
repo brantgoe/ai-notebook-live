@@ -29,7 +29,7 @@ needs VS Code's `NotebookEdit` API, which is what this extension uses.
 
 1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
 2. ```bash
-   code --install-extension ai-notebook-live-0.3.1.vsix
+   code --install-extension ai-notebook-live-0.3.2.vsix
    ```
 3. Reload the window.
 
@@ -110,6 +110,7 @@ from it; turn that on yourself if you want it.
 | `execution` | `ask` | Whether generated code runs |
 | `systemPromptExtra` | — | House style, e.g. *"Beginner class: keep code simple and comment every line"* |
 | `refusalFallback` | `true` | Retry a declined request on a fallback model |
+| `timeoutSeconds` | `300` | Give up after this long with **no output at all**. Measured from the last token, so a long think is not interrupted |
 | `bridge.execution` | `never` | Whether agent-pushed code runs |
 | `bridge.autoStart` | `false` | Start the bridge when a notebook opens |
 | `bridge.port` | `37417` | `0` picks a free port |
@@ -210,7 +211,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 72 tests, no VS Code needed
+npm test          # 76 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

@@ -425,6 +425,13 @@ function readOutputs(cell, { limit = 1200 } = {}) {
   const text = [];
   for (const output of cell.outputs || []) {
     for (const item of output.items || []) {
+      // The two guards above are careful and then this loop assumed every item
+      // had both fields, so one odd item turned Fix the Error into a TypeError.
+      // An item with no mime cannot be interpreted and one with no data has
+      // nothing to interpret, so neither is worth reporting.
+      if (!item || typeof item.mime !== 'string' || item.data === undefined || item.data === null) {
+        continue;
+      }
       const body = Buffer.from(item.data).toString('utf8');
       if (item.mime === 'application/vnd.code.notebook.error') {
         try {

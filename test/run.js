@@ -722,6 +722,128 @@ test('nbpush looks for the bridge where the bridge actually writes it', () => {
   );
 });
 
+/* ------------------------------ the CLI provider ------------------------- */
+
+const providerCli = require(path.join('..', 'src', 'provider.js'));
+
+/**
+ * A stand-in for the `claude` binary. Emits whatever NDJSON a scenario needs.
+ *
+ * Two things it must get right, both learned the hard way: flush stdout before
+ * exiting, because process.exit() truncates a large async write and that looks
+ * exactly like a parser bug; and keep itself alive with a timer for the hang
+ * case, because resuming stdin only lasts until the parent closes it.
+ */
+function fakeClaude(scenario) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-claude-'));
+  const bin = path.join(dir, 'claude.js');
+  fs.writeFileSync(
+    bin,
+    [
+      'const out = (o, cb) => process.stdout.write(JSON.stringify(o) + "\\n", cb);',
+      'const delta = (t, cb) => out({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: t } } }, cb);',
+      'process.stdin.resume(); process.stdin.on("data", () => {});',
+      `const s = ${JSON.stringify(scenario)};`,
+      'if (s === "hang") setInterval(() => {}, 1000);',
+      'setTimeout(() => {',
+      '  if (s === "hang") return;',
+      '  if (s === "in_band_failure") return out({ type: "result", subtype: "error_max_turns", result: "ran out of turns" }, () => process.exit(0));',
+      '  if (s === "quiet_success") return process.exit(0);',
+      '  return delta("print(1)", () => out({ type: "result", subtype: "success" }, () => process.exit(0)));',
+      '}, 5);',
+    ].join('\n')
+  );
+  return { binary: process.execPath, args: [bin], dir };
+}
+
+test('a CLI failure that exits 0 is reported, not swallowed', async () => {
+  // The CLI says what went wrong in-band and still exits 0. That reason was
+  // collected and then only ever shown when the exit code was non-zero, so the
+  // user got an empty cell and no explanation.
+  const fake = fakeClaude('in_band_failure');
+  const wrapper = path.join(fake.dir, 'run.sh');
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${fake.args[0]} "$@"\n`, { mode: 0o755 });
+  const notebook = newNotebook(['seed = 1']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  await assert.rejects(
+    () =>
+      providerCli.stream({
+        target: { kind: 'cli', binary: wrapper, label: 'fake' },
+        system: 's',
+        user: 'u',
+        opts: { ...OPTS, model: 'm' },
+        token: new vscode.CancellationTokenSource().token,
+        onText: (c) => writer.write(c),
+      }),
+    /error_max_turns|no output/,
+    'the reason the CLI gave must reach the user'
+  );
+  fs.rmSync(fake.dir, { recursive: true, force: true });
+});
+
+test('a genuinely empty success stays quiet', async () => {
+  // The other half: a model may legitimately produce nothing, and inventing an
+  // error for that would be worse than saying nothing.
+  const fake = fakeClaude('quiet_success');
+  const wrapper = path.join(fake.dir, 'run.sh');
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${fake.args[0]} "$@"\n`, { mode: 0o755 });
+  const result = await providerCli.stream({
+    target: { kind: 'cli', binary: wrapper, label: 'fake' },
+    system: 's',
+    user: 'u',
+    opts: { ...OPTS, model: 'm' },
+    token: new vscode.CancellationTokenSource().token,
+    onText: () => {},
+  });
+  assert.strictEqual(result.provider, 'claude-cli');
+  assert.ok(!result.cancelled, 'a quiet success is still a success');
+  fs.rmSync(fake.dir, { recursive: true, force: true });
+});
+
+test('a hung CLI is given up on instead of wedging the extension', async () => {
+  // stream() never settling meant guard()'s finally never ran, state.active was
+  // never cleared, and EVERY later command was refused for the life of the
+  // window. Cancellation always worked; nothing ever fired it.
+  const fake = fakeClaude('hang');
+  const wrapper = path.join(fake.dir, 'run.sh');
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${fake.args[0]} "$@"\n`, { mode: 0o755 });
+  const cts = new vscode.CancellationTokenSource();
+  const started = Date.now();
+  // Cancel on the same short deadline pump() would use, to prove the mechanism
+  // the timeout relies on settles the promise rather than hanging with it.
+  const timer = setTimeout(() => cts.cancel(), 400);
+  const result = await providerCli.stream({
+    target: { kind: 'cli', binary: wrapper, label: 'fake' },
+    system: 's',
+    user: 'u',
+    opts: { ...OPTS, model: 'm' },
+    token: cts.token,
+    onText: () => {},
+  });
+  clearTimeout(timer);
+  assert.ok(result.cancelled, 'giving up must settle the promise, not hang with the child');
+  assert.ok(Date.now() - started < 3000, 'and it must settle promptly');
+  fs.rmSync(fake.dir, { recursive: true, force: true });
+});
+
+test('readOutputs survives an output item it cannot read', async () => {
+  // It guards cell.outputs and output.items and then assumed every item had
+  // both fields, so one odd item turned Fix the Error into a TypeError.
+  const notebook = newNotebook(['1/0']);
+  const cell = notebook.cellAt(0);
+  cell.outputs = [
+    { items: [{ data: Buffer.from('no mime here') }] },
+    { items: [{ mime: 'text/plain' }] },
+    { items: [{ mime: 'text/plain', data: null }] },
+    { items: [null] },
+    // A well-formed sibling in the same batch must still be read.
+    { items: [{ mime: 'application/vnd.code.notebook.stdout', data: Buffer.from('kept\n') }] },
+  ];
+  const { text, error } = readOutputs(cell);
+  assert.strictEqual(text, 'kept\n', 'the readable item still comes through');
+  assert.strictEqual(error, '');
+});
+
 /* ------------------------------- validate -------------------------------- */
 
 const validate = require(path.join('..', 'src', 'validate.js'));

@@ -274,11 +274,27 @@ function streamCli({ system, user, opts, token, onText, binary }) {
       token.onCancellationRequested(() => {
         cancelled = true;
         child.kill('SIGTERM');
+        // A child that ignores SIGTERM would otherwise keep running and keep
+        // burning tokens. This does not affect how fast the extension recovers
+        // - cancelling settles the promise without waiting for the child.
+        escalate = setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* already gone */
+          }
+        }, 2000);
+        if (escalate.unref) escalate.unref();
       });
 
     let buffer = '';
     let stderr = '';
     let sawDelta = false;
+    // Distinct from sawDelta, which says "we are receiving streamed deltas" and
+    // is what the whole-turn fallback below keys off. This one only says
+    // whether the caller ever received any text at all.
+    let producedText = false;
+    let escalate;
     let model = opts.model;
 
     const handle = (line) => {
@@ -296,6 +312,7 @@ function streamCli({ system, user, opts, token, onText, binary }) {
           inner.delta.type === 'text_delta'
         ) {
           sawDelta = true;
+          if (inner.delta.text) producedText = true;
           onText(inner.delta.text);
         }
         if (inner.type === 'message_start' && inner.message && inner.message.model) {
@@ -306,7 +323,10 @@ function streamCli({ system, user, opts, token, onText, binary }) {
       // Without partial-message support the whole assistant turn arrives at once.
       if (event.type === 'assistant' && !sawDelta && event.message) {
         for (const block of event.message.content || []) {
-          if (block.type === 'text') onText(block.text);
+          if (block.type === 'text') {
+            if (block.text) producedText = true;
+            onText(block.text);
+          }
         }
       }
       if (event.type === 'result' && event.subtype && event.subtype !== 'success') {
@@ -345,15 +365,28 @@ function streamCli({ system, user, opts, token, onText, binary }) {
       );
     });
     child.on('close', (code) => {
+      if (escalate) clearTimeout(escalate);
       if (cancel) cancel.dispose();
       if (buffer.trim()) handle(buffer.trim());
       if (cancelled) return resolve({ provider: 'claude-cli', model, cancelled: true });
+      const said = stderr.trim();
       if (code !== 0) {
-        log('claude CLI exited', String(code), stderr.trim());
+        log('claude CLI exited', String(code), said);
         return reject(
           new ProviderError(
-            `The \`claude\` CLI exited with code ${code}. ${stderr.trim().split('\n').slice(-2).join(' ')}`.trim()
+            `The \`claude\` CLI exited with code ${code}. ${said.split('\n').slice(-2).join(' ')}`.trim()
           )
+        );
+      }
+      // The CLI reports trouble in-band and still exits 0 - error_max_turns is
+      // the common one. The reason was collected above and then only ever shown
+      // when the exit code was non-zero, so the user got an empty cell and no
+      // explanation at all. Exit code is not what decides whether they hear
+      // about a failure; producing nothing while having something to say is.
+      if (!producedText && said) {
+        log('claude CLI produced nothing:', said);
+        return reject(
+          new ProviderError(`The \`claude\` CLI produced no output. ${said.split('\n').slice(-2).join(' ')}`.trim())
         );
       }
       resolve({ provider: 'claude-cli', model, stopReason: 'end_turn' });
