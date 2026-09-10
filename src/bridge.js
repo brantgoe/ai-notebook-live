@@ -4,11 +4,21 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { CellWriter, editorFor, runCell, readOutputs, cellKindName } = require('./notebook');
+const {
+  CellWriter,
+  clipText,
+  editorFor,
+  runCell,
+  runApproved,
+  readOutputs,
+  cellKindName,
+} = require('./notebook');
 const validate = require('./validate');
 const { log } = require('./log');
 
 const MAX_BODY = 1024 * 1024;
+/** How long to keep draining a rejected upload so its status can be delivered. */
+const DRAIN_MS = 2000;
 
 /** An error that knows its own HTTP status, so callers get told the truth. */
 class BridgeError extends Error {
@@ -37,9 +47,17 @@ function defaultInfoDir() {
  * Requests must carry the token written to ~/.ai-notebook-live/bridge.json.
  */
 class Bridge {
-  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks }) {
+  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks, notify, version }) {
+    // Injected rather than required from package.json: requiring it here makes
+    // esbuild inline the WHOLE manifest - devDependencies, scripts and all -
+    // into the shipped bundle, which grew it by 16 KB of build detail.
+    this.version = version || '0.0.0';
     this.resolveNotebook = resolveNotebook;
     this.listNotebooks = listNotebooks;
+    // This module deliberately does not import vscode - it is the one piece
+    // that can be driven headlessly, and a test asserts as much. Anything the
+    // user needs to SEE goes out through here instead.
+    this.notify = notify || (() => {});
     // Asks the shared execution policy. A bridge caller can decline execution
     // but can never demand it - that escalation was the whole bug.
     this.decideRun = decideRun || (async () => ({ run: false, reason: 'no policy configured' }));
@@ -56,8 +74,22 @@ class Bridge {
 
   async start(port) {
     if (this.running) return { port: this.port, token: this.token };
+    // `running` only becomes true once listen() completes, so two overlapping
+    // starts - autoStart racing a manual one, or a double-click on the control
+    // panel row - each overwrote the other's token and server, and the first
+    // one's callback then read the SECOND server's address while it was still
+    // binding. The first server stayed listening on the port, unreachable, for
+    // the life of the window.
+    if (this.starting) return this.starting;
+    this.starting = this.begin(port).finally(() => {
+      this.starting = undefined;
+    });
+    return this.starting;
+  }
+
+  async begin(port) {
     this.token = crypto.randomBytes(18).toString('hex');
-    this.server = http.createServer((req, res) => {
+    const server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
         log('bridge error:', err && err.message);
         send(res, (err && err.status) || 500, { error: String((err && err.message) || err) });
@@ -65,15 +97,35 @@ class Bridge {
     });
 
     await new Promise((resolve, reject) => {
-      this.server.once('error', reject);
+      server.once('error', reject);
       // Loopback only - never expose notebook writes to the network.
-      this.server.listen(port, '127.0.0.1', () => {
-        this.server.removeListener('error', reject);
+      server.listen(port, '127.0.0.1', () => {
+        server.removeListener('error', reject);
         resolve();
       });
     });
-    this.port = this.server.address().port;
-    this.writeInfo();
+    // Bound to a local until it is actually listening, so a concurrent start
+    // cannot swap it out from under this one.
+    this.server = server;
+    this.port = server.address().port;
+    // Nothing keeps an 'error' listener on a live server, and Node emits one
+    // for accept-time failures such as EMFILE. An unhandled 'error' on an
+    // EventEmitter throws, and here that would take down the whole extension
+    // host - every extension in the window, not just this one.
+    server.on('error', (err) => log('bridge server error:', (err && err.message) || err));
+    try {
+      this.writeInfo();
+    } catch (err) {
+      // A bridge nobody can find is not a bridge. This used to be swallowed and
+      // the next line announced success anyway, leaving the user in a loop: VS
+      // Code says it is running, every client says it is not, and running the
+      // start command again just repeats both.
+      await this.stop();
+      throw new Error(
+        `the bridge started but could not publish its token to ${this.infoFile}: ` +
+          `${(err && err.message) || err}`
+      );
+    }
     log(`bridge listening on http://127.0.0.1:${this.port}`);
     return { port: this.port, token: this.token };
   }
@@ -136,6 +188,7 @@ class Bridge {
       this.writeExclusive(this.infoFile, payload);
     } catch (err) {
       log('could not write bridge info file:', err && err.message);
+      throw err;
     }
   }
 
@@ -214,6 +267,11 @@ class Bridge {
         ok: true,
         notebook: notebook ? notebook.uri.fsPath : null,
         cells: notebook ? notebook.cellCount : 0,
+        // So a client can tell an old host from a broken one. There was no way
+        // to: a 0.5.0 client asking a 0.4.0 bridge for /cells got "use POST",
+        // which says nothing about the endpoint being absent.
+        version: this.version,
+        supports: ['cells', 'replace', 'expect', 'stream'],
       });
     }
     if (!this.authorized(req)) return send(res, 401, { error: 'bad or missing token' });
@@ -225,7 +283,16 @@ class Bridge {
       return send(res, 200, this.readCells(url.searchParams));
     }
 
-    if (req.method !== 'POST') return send(res, 405, { error: 'use POST' });
+    const KNOWN = ['/health', '/cells', '/cell', '/cell/replace', '/cell/stream'];
+    if (!KNOWN.includes(url.pathname)) {
+      return send(res, 404, { error: `unknown path: ${url.pathname}` });
+    }
+    if (req.method !== 'POST') {
+      // Allow, per RFC 9110 - and a 405 now means "wrong method for a path I
+      // have", never "I have never heard of that path".
+      res.setHeader('allow', url.pathname === '/cells' || url.pathname === '/health' ? 'GET' : 'POST');
+      return send(res, 405, { error: `use POST for ${url.pathname}` });
+    }
 
     if (url.pathname === '/cell') {
       const body = await readJson(req);
@@ -272,10 +339,44 @@ class Bridge {
       // Handed back so the caller - and the user reading a log - can see what
       // was destroyed. Ctrl+Z also restores it, but only if somebody noticed.
       const previous = cell.document.getText();
+
+      // An optional precondition on what the caller believes it is replacing.
+      //
+      // A read from /cells is clipped at 4000 characters, and nothing stopped a
+      // caller reconstructing a clipped cell and writing the truncation back
+      // over the real thing. Indices also shift under a live editor, so "cell 7"
+      // at read time need not be cell 7 now. Optional in 0.6.0 and required
+      // later, so existing callers keep working while they are updated.
+      const expect = url.searchParams.get('expect');
+      if (expect !== null && expect !== previous) {
+        throw new BridgeError(
+          `cell ${at} does not contain what you expected, so it was not replaced. ` +
+            'Read it again and retry if you still want to.',
+          409
+        );
+      }
+      if (expect === null) {
+        log(`replace: cell ${at} rewritten with no expect= precondition`);
+      }
+
       const writer = await CellWriter.replace(notebook, cell);
       try {
         writer.write(code);
+        // The guard that has always protected /cell, on the one path where the
+        // consequence is destruction rather than clutter. Without it a body of
+        // "", " ", "\n" or "```" answered 200 and BLANKED the cell - measured,
+        // and the fix changed no existing test, which is why it survived.
+        await requireProduced(writer, 'replace');
         const text = await writer.end();
+        // A cell changing under the user's cursor used to leave NO trace at all:
+        // no log line, nothing on screen. The only evidence was the text itself
+        // being different, and Ctrl+Z only helps somebody who noticed.
+        log(`replace: cell ${at} in ${path.basename(notebook.uri.fsPath)} - ` +
+          `${previous.length} chars replaced with ${text.length}`);
+        this.notify(
+          'info',
+          `An agent rewrote cell ${at} of ${path.basename(notebook.uri.fsPath)}. Ctrl+Z undoes it.`
+        );
         return send(res, 200, {
           ok: true,
           notebook: notebook.uri.fsPath,
@@ -300,7 +401,11 @@ class Bridge {
       // sitting in the notebook for as long as it hung.
       let writer;
       try {
-        for await (const chunk of req) {
+        // destroyOnReturn: false, because leaving this loop early - which is
+        // exactly what a 413 or a bad character does - would otherwise destroy
+        // the request, and a destroyed request means Node resets the socket
+        // before send() can drain it and deliver the status.
+        for await (const chunk of req.iterator({ destroyOnReturn: false })) {
           size += chunk.length;
           if (size > MAX_BODY) throw new BridgeError('body too large', 413);
           // Per chunk, before anything is written. Node's utf8 decoder joins
@@ -322,10 +427,17 @@ class Bridge {
       if (!writer) {
         return send(res, 400, { error: 'nothing to insert: the request body was empty' });
       }
-      return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+      try {
+        return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+      } catch (err) {
+        // /cell wraps this and /cell/stream did not, so a failure in the final
+        // write left the half-written cell sitting in the notebook.
+        await writer.abandon();
+        throw err;
+      }
     }
 
-    return send(res, 404, { error: 'unknown path' });
+    return send(res, 404, { error: `unknown path: ${url.pathname}` });
   }
 
   /**
@@ -361,12 +473,23 @@ class Bridge {
         index: cell.index,
         kind: cellKindName(cell),
         language: cell.document.languageId,
-        source: clipped ? `${text.slice(0, LIMIT)}\n...<truncated>` : text,
+        source: clipped ? clipText(text, LIMIT) : text,
       };
+      // Per cell, not just once for the whole response. A caller deciding
+      // whether it may safely rewrite cell 7 needs to know about CELL 7, and a
+      // response-level flag set by some other cell tells it nothing. This is the
+      // read half of the same hazard `expect=` guards on the write half.
+      if (clipped) out.truncated = true;
       if (wantOutputs) {
         const seen = readOutputs(cell);
         if (seen.error) out.error = seen.error;
         if (seen.text) out.output = seen.text;
+        // Outputs are clipped too, and that never set the flag at all - so a
+        // response could carry "...<truncated>" while claiming nothing was.
+        if (seen.truncated) {
+          out.truncated = true;
+          truncated = true;
+        }
       }
       return out;
     });
@@ -423,10 +546,7 @@ class Bridge {
     const requested = raw === undefined || raw === null ? undefined : validate.boolish(raw);
     // Nothing usable arrived: take the cell back out rather than leaving an
     // empty one behind. pump() has always done this; the bridge did not.
-    if (!writer.produced()) {
-      await writer.abandon();
-      throw new BridgeError('nothing to insert: the body produced no content', 400);
-    }
+    await requireProduced(writer, 'insert');
     const text = await writer.end();
     const decision = await this.decideRun({
       requested,
@@ -435,10 +555,24 @@ class Bridge {
       blocking: false,
       onLateApproval: async () => {
         const cell = writer.cell();
-        if (cell) await runCell(writer.notebook, cell.index);
+        if (!cell) return;
+        // What was approved, not merely which cell. The dialog can be open for
+        // as long as the user takes to read it, and another request can rewrite
+        // that cell in the meantime - so the code being run here is checked
+        // against the code that was actually shown.
+        if (!(await runApproved(writer.notebook, cell.index, text))) {
+          log(`late approval declined: cell ${cell.index} changed after it was shown`);
+          this.notify(
+            'warning',
+            'AI Notebook Live: that cell changed while the approval was open, so it was not run. ' +
+              'Look at it and run it yourself if you still want to.'
+          );
+        }
       },
     });
-    if (decision.run) await runCell(writer.notebook, writer.index);
+    if (decision.run && !(await runApproved(writer.notebook, writer.index, text))) {
+      log(`execution declined: cell ${writer.index} changed before it could run`);
+    }
     return {
       ok: true,
       // Which notebook it actually landed in. nbpush echoes this, and it is what
@@ -463,19 +597,52 @@ function clampIndex(raw, fallback, count) {
   return Math.min(Math.max(0, n), count);
 }
 
+/**
+ * Refuse a writer that has nothing worth writing, and leave no trace.
+ *
+ * Lifted out of closeWriter so /cell/replace can use it too. Deliberately NOT
+ * by routing replace through closeWriter: that also asks the execution policy,
+ * and a replaced cell has never been executable. Fixing an empty-body bug is
+ * not a reason to hand agents a power they did not have.
+ */
+async function requireProduced(writer, what) {
+  if (writer.produced()) return;
+  await writer.abandon();
+  throw new BridgeError(`nothing to ${what}: the body produced no content`, 400);
+}
+
 function send(res, status, body) {
   const payload = JSON.stringify(body);
+  const req = res.req;
+  const unread = Boolean(req) && !req.readableEnded && !req.destroyed;
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
   });
   res.end(payload);
+  if (!unread) return;
+  // Ending a response while the request body is still arriving makes Node reset
+  // the socket, and a reset DISCARDS the bytes we just wrote - so the caller got
+  // ECONNRESET instead of the 413 explaining what it did wrong. Draining the
+  // rest lets the close be graceful and the status actually arrive.
+  //
+  // Bounded, so an endless upload cannot hold the connection open: whatever has
+  // not turned up within the window was not going to.
+  req.resume();
+  const giveUp = setTimeout(() => req.destroy(), DRAIN_MS);
+  if (giveUp.unref) giveUp.unref();
+  const done = () => clearTimeout(giveUp);
+  req.once('end', done);
+  req.once('error', done);
+  req.once('close', done);
 }
 
 async function readJson(req) {
   let body = '';
   req.setEncoding('utf8');
-  for await (const chunk of req) {
+  // Same reason as /cell/stream: throwing out of this loop must not destroy the
+  // request, or the 413 never reaches the caller.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     body += chunk;
     if (body.length > MAX_BODY) throw new BridgeError('body too large', 413);
   }

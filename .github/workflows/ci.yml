@@ -10,6 +10,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Actions are pinned to commit SHAs, not tags. A mutable tag is a supply-chain
+# hazard anywhere, and softprops/action-gh-release is third-party AND runs in the
+# job that holds contents:write - a retagged v2 could substitute the released
+# .vsix.
+#
+# Least privilege by default. Only the release job needs to write anything, and
+# it declares that for itself.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -19,8 +29,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [20, 22]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -31,13 +41,19 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test
+      # `npm test` runs the build, which REGENERATES THIRD-PARTY-NOTICES.md, so
+      # the test asserting every bundled package is named there was checking a
+      # fixture it had just written and could never fail. Drift fails here now
+      # instead of being silently repaired and left stale in git.
+      - name: The committed notices must match what the bundle pulled in
+        run: git diff --exit-code -- THIRD-PARTY-NOTICES.md
       - run: npx @vscode/vsce package --allow-missing-repository
       - name: Keep the bundle small
         run: |
@@ -48,7 +64,7 @@ jobs:
             echo "::error::$COUNT files in the package; the bundle has regressed"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vsix
           path: '*.vsix'
@@ -60,22 +76,45 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test
       - run: npx @vscode/vsce package --allow-missing-repository
+      # github.ref_name is "v0.6.0" but vsce names the file
+      # "ai-notebook-live-0.6.0.vsix" - no v. Every release so far has told
+      # people to install a filename that does not exist.
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # A .vsix passed hand to hand has no signature a recipient can check, and
+      # VS Code does not verify one for a local file install. The zip is not
+      # byte-reproducible (it embeds mtimes) but the code inside it is, so
+      # publish the hash of that.
+      - name: Checksums
+        run: |
+          sha256sum *.vsix > SHA256SUMS
+          unzip -p *.vsix extension/dist/extension.js | sha256sum \
+            | sed 's|-|extension/dist/extension.js|' >> SHA256SUMS
+          cat SHA256SUMS
       # Distribution is a GitHub Release, so this job IS the delivery mechanism.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: '*.vsix'
+          files: |
+            *.vsix
+            SHA256SUMS
           body: |
             Install:
 
-                code --install-extension ai-notebook-live-${{ github.ref_name }}.vsix
+                code --install-extension ai-notebook-live-${{ steps.v.outputs.version }}.vsix
 
-            See CHANGELOG.md for what changed.
+            Verify what you downloaded:
+
+                unzip -p ai-notebook-live-${{ steps.v.outputs.version }}.vsix extension/dist/extension.js | sha256sum
+
+            and compare with `extension/dist/extension.js` in SHA256SUMS.
+
+            See CHANGELOG.md for what changed, and SECURITY.md for how to report a problem.
           generate_release_notes: true

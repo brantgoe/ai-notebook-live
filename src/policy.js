@@ -119,12 +119,19 @@ async function decideExecution({
 
 function promptFor(intent, preview) {
   const detail = preview.length > 900 ? `${preview.slice(0, 900)}\n...` : preview;
+  const buttons = ['Run it'];
+  // No blanket grant for code another program pushed in. The grant is keyed on
+  // intent alone, so one click on one agent's harmless-looking cell approved
+  // EVERY later push from ANY local program for the life of the window -
+  // measured: three pushes, one dialog shown, all three executed. Your own
+  // generations keep the convenience, because you asked for each of them by
+  // name; nothing asks you before an agent pushes.
+  if (intent !== 'bridge') buttons.push('Always run these this session');
   // Modal on purpose: a consent prompt that can be missed is not consent.
   return vscode.window.showWarningMessage(
     `Run this ${LABEL[intent] || 'generated'} code in your notebook?`,
     { modal: true, detail },
-    'Run it',
-    'Always run these this session'
+    ...buttons
   );
 }
 

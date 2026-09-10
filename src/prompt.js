@@ -1,7 +1,7 @@
 'use strict';
 const vscode = require('vscode');
 const path = require('path');
-const { readOutputs, notebookLanguage } = require('./notebook');
+const { readOutputs, notebookLanguage, clipText } = require('./notebook');
 
 const CELL_CLIP = 2000;
 
@@ -42,8 +42,9 @@ function markdownSystem(extra) {
 }
 
 function clip(text, limit = CELL_CLIP) {
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n...<truncated>`;
+  // Shared, so the surrogate-splitting fix cannot be applied to two of the
+  // three clip sites and forgotten at the third.
+  return clipText(text, limit);
 }
 
 function describeCell(cell, { includeOutputs }) {

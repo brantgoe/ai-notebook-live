@@ -7,6 +7,127 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.6.0] - 2026-09-10
+
+A ten-expert review of 0.5.0 — security, VS Code platform, concurrency, test
+efficacy, protocol, the fence parser, UX, reliability, licensing and scope. This
+release is what came out of it. Nothing new was added; a lot was made true.
+
+### Fixed — your work
+
+- **A failed revise could destroy the cell it was revising.** `abandon()` asked
+  the writer to put your text back, the writer correctly refused when you had
+  typed into the cell, and `abandon()` reported success anyway — so you were
+  told "your cell was put back" when it had not been. The button it offered,
+  *Keep what the AI wrote*, then overwrote what you had typed as well. Both
+  fixed; the message now says which of the three things actually happened.
+- **A failure in the final write left a half-written cell with no way back.**
+  That step sat outside the error handling entirely.
+- **`POST /cell/replace` with an empty or whitespace-only body answered 200 and
+  blanked the cell.** The guard that has always protected `/cell` was never
+  reached by the newer, destructive path.
+- **A fenced block whose lines end in a bare carriage return lost the whole
+  cell**, silently, in both parsing modes.
+- **Clipping a long cell could cut a character in half**, producing a notebook
+  `nbformat` and `nbconvert` cannot read.
+
+### Fixed — consent
+
+- **An approval approved a cell, not the code in it.** With
+  `bridge.execution: ask`, a second request could rewrite the cell while the
+  dialog was open, so clicking *Run it* ran code you were never shown. Execution
+  now checks the cell still holds what you were asked about.
+- **A cell you had typed into could be executed.** The writer knew you had taken
+  it over and nothing downstream ever asked.
+- **One *Always run these this session* click approved every later agent push**
+  for the life of the window. That button is no longer offered for pushed code.
+- **Reading and overwriting left no trace at all** — no log line, nothing on
+  screen. Both are recorded now, and an overwrite says which cell.
+- **The bridge started in a folder you had not trusted**, which the Restricted
+  Mode dialog says it will not do.
+
+### Fixed — lifecycle
+
+- **Every finished generation left a timer armed for five minutes** that
+  cancelled whatever was running when it fired, and blamed you for it.
+- **Reloading mid-generation orphaned the `claude` process**, still spending
+  your plan quota with no window left to cancel it.
+- The status bar did not repaint when the bridge opened a socket — the one
+  moment that indicator exists for. *Copy Agent Bridge Example Command* also
+  started the bridge silently; it says so now.
+- A hung CLI could still wedge the window permanently, via a case the timeout
+  could not reach.
+- `claudePath` pointing at a *directory* was accepted as the CLI.
+
+### Fixed — correctness
+
+- Model output was never validated. Characters a kernel cannot run reached the
+  cell; they are repaired now rather than refused, so one invisible character
+  cannot discard a whole generation.
+- The character rules were wrong in both directions, checked against real
+  Python: non-breaking space, BOM, soft hyphen and the zero-width characters
+  were allowed through, and form feed — which is legal — was refused.
+- An indented closing fence was not recognised, leaving fence markers in the
+  cell.
+- An insert could claim a cell **you** had just added above it.
+
+### Fixed — the CLI and the docs
+
+- **`nbpush --list` and `--replace` never worked.** Both were announced in
+  0.5.0, and neither was ever accepted by the argument parser. Now they are —
+  and `--replace` on a pipe used to silently *append* rather than replace.
+- **Every release told you to install a filename that does not exist**
+  (`ai-notebook-live-v0.6.0.vsix`; the file has no `v`).
+- `Ctrl+Alt+G` and `Ctrl+Alt+R` were dead while the cursor was inside a cell.
+- The install steps now work on a Mac, where `code` is not on `PATH` by default.
+- An `ANTHROPIC_API_KEY` left in your shell silently switches you to paid
+  billing; the README says so now.
+
+### Fixed — talking to other tools
+
+- **A malformed line got no answer at all**, so an MCP client with a request
+  outstanding waited forever. Batch requests vanished the same way. Both are
+  answered now, and an unknown method returns `-32601` rather than a generic
+  server error — which is how a client tells "I do not do that" from "I broke".
+- **Calling a tool that does not exist reported "the bridge is not running."**
+  The name was checked only after contacting VS Code, so a typo looked like a
+  configuration problem.
+- **Queued responses were lost when the input stream closed** — measured, 24 of
+  40 with a slow reader — because `process.exit` does not flush a pending write.
+- `/health` now reports the extension version and which verbs it supports. There
+  was no way to tell an old bridge from a broken one.
+- An unknown path is a `404`; a `405` now means the method was wrong for a path
+  that does exist.
+
+### Security and supply chain
+
+- `SECURITY.md`: where to report a problem, what this extension can actually do,
+  and how to check that a downloaded `.vsix` holds the code this repo built.
+- Releases publish `SHA256SUMS`, including the hash of the bundled
+  `extension.js` — the `.vsix` zip is not byte-reproducible, but its contents
+  are.
+- CI actions are pinned to commit SHAs rather than mutable tags, and the
+  workflow defaults to `contents: read`.
+- `standardwebhooks` ships no license file, so the notices carried a link rather
+  than a notice; MIT requires the text itself to travel. It is embedded now,
+  along with the discrepancy found while checking: the package declares MIT
+  while its repository publishes Apache-2.0.
+
+### Added
+
+- `expect=` on `/cell/replace`: the source you believe you are replacing. The
+  edit is refused if the cell has changed, instead of destroying something
+  unseen. Optional now, required in a later release.
+- `/cells` marks each clipped cell `truncated`, rather than once per response.
+- `AI_NOTEBOOK_TEST_ORDER=reverse|shuffle:<seed>` for the test suite.
+
+### Internal
+
+111 tests, up from 80. The number matters less than what they cover: the old
+suite tested the modules and almost never checked the product used them —
+deleting the entire execution policy from `extension.js` left it green. Every
+mutation the review found surviving now fails.
+
 ## [0.5.0] — 2026-09-09
 
 ### Added

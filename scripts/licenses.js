@@ -57,6 +57,37 @@ function readPackage(name) {
   };
 }
 
+/** Canonical texts, for packages that declare a licence and ship no file. */
+const CANONICAL = {
+  MIT: `Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`,
+};
+
+/** Things worth saying about a specific package, checked by hand. */
+const NOTES = {
+  standardwebhooks:
+    "Note: this package's `package.json` declares MIT, while the upstream " +
+    'repository publishes an Apache-2.0 LICENSE at its root. The declared ' +
+    'licence is reproduced above; Apache-2.0 is the more restrictive of the two ' +
+    'and its terms are also honoured here (attribution retained, no trademark ' +
+    'use, changes not made). Raised upstream is the right long-term fix.',
+};
+
 function generate(metafile) {
   const packages = packagesFrom(metafile).map(readPackage);
   const missing = packages.filter((p) => !p.text);
@@ -82,8 +113,24 @@ function generate(metafile) {
         `This package ships no license file. Its \`package.json\` declares **${p.license}**` +
           `${p.author ? `, authored by ${p.author}` : ''}.`,
         '',
-        p.repo ? `The authoritative license text is published at ${p.repo}.` : '',
-        ''
+        p.repo ? `Upstream: ${p.repo}` : '',
+        '',
+        // A URL is not a notice. MIT and BSD both require the permission text
+        // itself to travel with the software, so where a package declares one
+        // and ships no file, the canonical text of the licence it declared goes
+        // here - marked as such, with no copyright line invented on its behalf.
+        ...(CANONICAL[p.license]
+          ? [
+              `No copyright line was supplied by the package. The canonical text of ${p.license}, ` +
+                'reproduced so that the permission notice travels with this software:',
+              '',
+              '```',
+              CANONICAL[p.license],
+              '```',
+              '',
+            ]
+          : []),
+        ...(NOTES[p.name] ? [NOTES[p.name], ''] : [])
       );
     }
   }

@@ -9,7 +9,9 @@ function output() {
 }
 
 function log(...parts) {
-  const stamp = new Date().toISOString().slice(11, 19);
+  // Date as well as time. A pasted output channel could not be ordered against
+  // anything, and a session spanning midnight read as though it went backwards.
+  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
   output().appendLine(`[${stamp}] ${parts.join(' ')}`);
 }
 
