@@ -1649,6 +1649,148 @@ test('poison from the model never reaches the cell', async () => {
   });
 });
 
+test('the extension actually asks the execution policy', async () => {
+  // src/policy.js is the best-tested module in the repo, and NOTHING checked
+  // that the product consults it. Measured by a reviewer: replacing the whole
+  // decideExecution call in pump with `{run: true}` left the suite green - the
+  // entire execution policy deleted from the product, 80/80 passing.
+  await withFakeClaude('ok', async (binary) => {
+    const extension = require(path.join('..', 'extension.js'));
+    const notebook = newNotebook(['answer = 42']);
+    const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+    vscode.window.visibleNotebookEditors.push(editor);
+    vscode.window.activeNotebookEditor = editor;
+    vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+    vscode.__test.config.set('aiNotebookLive.claudePath', binary);
+    // The setting says never. If the policy is consulted, nothing runs.
+    vscode.__test.config.set('aiNotebookLive.execution', 'never');
+    vscode.__test.inputs.push('simplify it');
+    const context = {
+      subscriptions: [],
+      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    };
+    extension.activate(context);
+    try {
+      await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+      assert.strictEqual(notebook.cellAt(0).document.getText(), 'print(1)', 'the cell was written');
+      assert.strictEqual(
+        ranCells().length,
+        0,
+        'execution:never must actually mean never - the policy has to be asked'
+      );
+    } finally {
+      vscode.window.activeNotebookEditor = undefined;
+      await extension.deactivate();
+    }
+  });
+});
+
+test('the bridge is wired to the bridge policy, not the user\'s own', async () => {
+  // decideRun is built in activate(), and nothing pinned which intent it passes.
+  // Measured: wiring it to intent 'generate' - so agent pushes inherit the
+  // user's OWN-generation setting, which defaults to `ask` rather than `never` -
+  // left the suite green. So did forcing requested:true.
+  const extension = require(path.join('..', 'extension.js'));
+  const notebook = newNotebook(['x = 1']);
+  const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+  vscode.window.visibleNotebookEditors.push(editor);
+  vscode.window.activeNotebookEditor = editor;
+  // The two settings disagree on purpose: only the bridge one may apply here.
+  vscode.__test.config.set('aiNotebookLive.execution', 'always');
+  vscode.__test.config.set('aiNotebookLive.bridge.execution', 'never');
+  vscode.__test.config.set('aiNotebookLive.bridge.port', 0);
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  extension.activate(context);
+  try {
+    await vscode.__test.commands.get('aiNotebookLive.startBridge')();
+    const info = JSON.parse(fs.readFileSync(path.join(BRIDGE_HOME, 'bridge.json'), 'utf8'));
+    const res = await call(info.port, info.token, {
+      path: '/cell?position=end&run=1',
+      body: JSON.stringify({ code: 'print("pushed")' }),
+    });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(JSON.parse(res.body).ran, false, 'bridge.execution:never governs a push');
+    assert.strictEqual(ranCells().length, 0, 'and nothing ran, whatever run=1 asked for');
+
+    // The other direction, and the half that `intent` alone does not pin: with
+    // the setting at ALWAYS, a caller passing run=0 must still be able to
+    // decline. A request may only ever lower the decision - forcing
+    // requested:true into decideRun is a mutation nothing else here catches,
+    // because under `never` the request is irrelevant by design.
+    vscode.__test.config.set('aiNotebookLive.bridge.execution', 'always');
+    const declined = await call(info.port, info.token, {
+      path: '/cell?position=end&run=0',
+      body: JSON.stringify({ code: 'print("declined")' }),
+    });
+    assert.strictEqual(JSON.parse(declined.body).ran, false, 'run=0 must be honoured');
+    assert.strictEqual(ranCells().length, 0, 'a caller can always decline for itself');
+  } finally {
+    await vscode.__test.commands.get('aiNotebookLive.stopBridge')();
+    vscode.window.activeNotebookEditor = undefined;
+    await extension.deactivate();
+  }
+});
+
+test('the bridge binds loopback and answers nothing before it authorises', async () => {
+  // Two mutations a reviewer landed with the suite still green: binding
+  // 0.0.0.0, and routing GET /cells ABOVE the auth gate so the whole notebook
+  // could be read unauthenticated. Neither had a test.
+  const notebook = newNotebook(['secret = "hunter2"']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port } = await bridge.start(0);
+  try {
+    assert.strictEqual(
+      bridge.server.address().address,
+      '127.0.0.1',
+      'the bridge must never be reachable from the network'
+    );
+    // Every route, with no token at all.
+    for (const [method, p] of [
+      ['GET', '/cells'],
+      ['GET', '/cells?outputs=1'],
+      ['GET', '/health'],
+      ['POST', '/cell'],
+      ['POST', '/cell/replace?index=0'],
+      ['POST', '/cell/stream'],
+    ]) {
+      // A body only where one belongs; a GET carrying one is its own oddity and
+      // not what this test is about.
+      const res = await call(port, undefined, {
+        method,
+        path: p,
+        body: method === 'POST' ? '{"code":"x=1"}' : undefined,
+      });
+      assert.strictEqual(res.status, 401, `${method} ${p} must need the token`);
+      assert.ok(!res.body.includes('hunter2'), `${method} ${p} must not leak cell contents`);
+    }
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('owns() notices a re-indent, not only a trailing space', async () => {
+  // The tolerance exists for a save that trims trailing whitespace. Widening it
+  // to ignore ALL whitespace - so a user re-indenting their code looks like our
+  // own write - left the suite green: the only test covered TRAILING space.
+  const notebook = newNotebook(['def f():\n    return 1']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('def f():\n    return 2');
+  await writer.flush();
+  // The user re-indents: same characters, different leading whitespace.
+  notebook.cellAt(0).document.text = 'def f():\n\treturn 2';
+  writer.write('  # more');
+  await writer.flush();
+  assert.ok(writer.foreign, 'a re-indent is a person editing, not an autosave');
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'def f():\n\treturn 2');
+});
+
 test('a hung CLI is given up on instead of wedging the extension', async () => {
   // stream() never settling meant guard()'s finally never ran, state.active was
   // never cleared, and EVERY later command was refused for the life of the
@@ -2888,6 +3030,12 @@ test('the packaged extension is small, complete and actually loadable', async ()
   // entry point, not the one the manifest declares.
   const main = path.join(root, manifest.main);
   assert.ok(fs.existsSync(main), `manifest.main (${manifest.main}) does not exist - run npm run build`);
+  // And LOAD it. Checking the file exists is not checking it works: a bundle
+  // that throws on require - an `external` becoming a hard dependency, say -
+  // would have shipped with this test green and a confident name on it.
+  const bundled = require(main);
+  assert.strictEqual(typeof bundled.activate, 'function', 'the bundle must export activate');
+  assert.strictEqual(typeof bundled.deactivate, 'function', 'and deactivate');
 
   // Everything the licences of the bundled packages require has to ship.
   for (const required of ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md', 'CHANGELOG.md', 'README.md']) {

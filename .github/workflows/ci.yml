@@ -10,6 +10,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege by default. Only the release job needs to write anything, and
+# it declares that for itself.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -38,6 +43,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      # `npm test` runs the build, which REGENERATES THIRD-PARTY-NOTICES.md, so
+      # the test asserting every bundled package is named there was checking a
+      # fixture it had just written and could never fail. Drift fails here now
+      # instead of being silently repaired and left stale in git.
+      - name: The committed notices must match what the bundle pulled in
+        run: git diff --exit-code -- THIRD-PARTY-NOTICES.md
       - run: npx @vscode/vsce package --allow-missing-repository
       - name: Keep the bundle small
         run: |
@@ -68,6 +79,11 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npx @vscode/vsce package --allow-missing-repository
+      # github.ref_name is "v0.6.0" but vsce names the file
+      # "ai-notebook-live-0.6.0.vsix" - no v. Every release so far has told
+      # people to install a filename that does not exist.
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       # Distribution is a GitHub Release, so this job IS the delivery mechanism.
       - uses: softprops/action-gh-release@v2
         with:
@@ -75,7 +91,7 @@ jobs:
           body: |
             Install:
 
-                code --install-extension ai-notebook-live-${{ github.ref_name }}.vsix
+                code --install-extension ai-notebook-live-${{ steps.v.outputs.version }}.vsix
 
             See CHANGELOG.md for what changed.
           generate_release_notes: true
