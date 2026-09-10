@@ -50,6 +50,17 @@ function newNotebook(cells = []) {
   vscode.__test.notebooks.push(notebook);
   vscode.__test.executed.length = 0;
   vscode.window.visibleNotebookEditors.length = 0;
+  // Everything below used to be cleaned up by whichever test happened to
+  // remember, in an ad-hoc `finally`. One omission and a switch left on by an
+  // earlier test silently changes the meaning of a later one - the suite is
+  // ordering-dependent in exactly that way today. `config` is deliberately NOT
+  // reset here: tests configure settings before opening their notebook.
+  vscode.__test.edits = 0;
+  vscode.__test.failApplyEdit = false;
+  vscode.__test.onBeforeApply = null;
+  vscode.__test.inputs.length = 0;
+  vscode.__test.picks.length = 0;
+  vscode.__test.shown.length = 0;
   return notebook;
 }
 
@@ -104,13 +115,34 @@ const FENCE_TOKENS = [
   'a',
   'print(1)',
   '~~~', //        tilde fences exist in markdown but are not handled
+  // Below here: shapes the alphabet could not reach at all until 2026-09-09, which
+  // is exactly why an indented closing fence went unnoticed. A space and a tab can
+  // only appear inside '``` ' otherwise, so '\n ' and '\n\t' were unreachable.
+  ' ',
+  '\t',
+  '  ```', //      up to 3 spaces of indent is a legal CommonMark fence
+  '   ```',
+  '`````', //      a closer may be longer than its opener
+  '```py {.hl}', //an info string with attributes
+  "'''", //        the other Python string quote
+  ' ', //     NBSP: the invisible character models emit most often
+  '﻿', //     BOM
+  '​', //     zero-width space
+  '\u{1f600}', //  a surrogate pair, to catch a cut between its halves
 ];
 
-/** Seeded so a failure is reproducible from the printed seed, unlike Math.random. */
+/**
+ * Seeded so a failure is reproducible from the printed seed, unlike Math.random.
+ *
+ * Math.imul, not `*`: state * 1103515245 reaches 2.4e18, far past 2^53, so the
+ * low bits this keeps were float rounding noise. Measured periods before the
+ * fix were 10,466 for most seeds and 220 for seed 777771 - 50,000 draws were
+ * really ~2,600 distinct strings.
+ */
 function lcg(seed) {
   let state = seed;
   return () => {
-    state = (state * 1103515245 + 12345) & 0x7fffffff;
+    state = (Math.imul(state, 1103515245) + 12345) & 0x7fffffff;
     return state / 0x7fffffff;
   };
 }
@@ -142,6 +174,46 @@ test('unfence never retracts text it has already emitted', () => {
             `${JSON.stringify(partial)}, which is not a prefix of ${JSON.stringify(whole)}`
         );
       }
+    }
+  }
+});
+
+/**
+ * The other half of the contract, and the half that was missing until 2026-09-09.
+ *
+ * The retraction test above is satisfied perfectly by a parser that returns ''
+ * for everything - measured, it stays green. So it pins only that we never emit
+ * too MUCH. This pins that we emit enough: where the input carries no ambiguity
+ * at all, streaming must already have the whole answer, because that is what
+ * makes a cell fill in as the model types rather than in one jump at the end.
+ */
+const PLAIN_TOKENS = ['a', 'print(1)', '\n', '\r\n', '\r', ' ', '\t', 'x = 1', '"""', "'''"];
+
+test('unfence emits everything it safely can, not merely something prefix-stable', () => {
+  for (const seed of [1, 20260909]) {
+    const rnd = lcg(seed);
+    for (let n = 0; n < 4000; n += 1) {
+      let body = '';
+      const parts = 1 + Math.floor(rnd() * 6);
+      for (let i = 0; i < parts; i += 1) {
+        body += PLAIN_TOKENS[Math.floor(rnd() * PLAIN_TOKENS.length)];
+      }
+      // No backtick anywhere: there is nothing to be conservative about, so the
+      // text is the answer.
+      const expected = body.replace(/^\s+/, '');
+      assert.strictEqual(
+        unfence(body),
+        expected,
+        `seed ${seed}: unfenced text ${JSON.stringify(body)} must be emitted as it arrives`
+      );
+      if (!expected) continue;
+      // A closed fence around that same text: the closer is already present, so
+      // streaming must not wait for the end of the stream to hand back the body.
+      assert.strictEqual(
+        unfence(`\`\`\`python\n${body}\n\`\`\``),
+        body,
+        `seed ${seed}: a closed fence around ${JSON.stringify(body)} must emit its body`
+      );
     }
   }
 });
@@ -431,8 +503,26 @@ test('abandon() is idempotent', async () => {
   const notebook = newNotebook(['orig']);
   const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
   writer.write('partial');
-  await writer.abandon();
-  await writer.abandon();
+  // Flush first. Without this the document never diverges from 'orig', so both
+  // calls are no-ops against a cell that was already correct and the assertion
+  // below holds however wrong abandon() is - measured: making abandon()
+  // non-idempotent left this test green.
+  await writer.flush();
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'partial');
+
+  const first = await writer.abandon();
+  assert.strictEqual(first.restored, true, 'the first call does the restoring');
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'orig');
+
+  const editsBefore = vscode.__test.edits;
+  const second = await writer.abandon();
+  assert.strictEqual(second.restored, false, 'the second has nothing left to restore');
+  // The point of idempotence is not "ends up the same" but "does nothing".
+  assert.strictEqual(
+    vscode.__test.edits,
+    editsBefore,
+    'a second abandon must apply no edit at all, not a harmless one'
+  );
   assert.strictEqual(notebook.cellAt(0).document.getText(), 'orig');
   assert.strictEqual(notebook.cellCount, 1);
 });
@@ -1276,6 +1366,15 @@ test('the bridge never makes an HTTP caller wait on a dialog', async () => {
 function call(port, token, { method = 'POST', path: p = '/cell', body, chunks, headers = {} }) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let response; // set the instant headers arrive, before the body is read
+    let text = '';
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      // The server may answer (and cut us off) before we finish uploading.
+      req.destroy();
+      resolve({ status: response.statusCode, body: text });
+    };
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -1285,27 +1384,32 @@ function call(port, token, { method = 'POST', path: p = '/cell', body, chunks, h
         headers: { ...(token ? { 'x-ai-notebook-token': token } : {}), ...headers },
       },
       (res) => {
-        let text = '';
+        response = res;
         res.on('data', (c) => {
           text += c;
         });
-        res.on('end', () => {
-          settled = true;
-          // The server may answer (and cut us off) before we finish uploading.
-          req.destroy();
-          resolve({ status: res.statusCode, body: text });
-        });
+        res.on('end', finish);
+        // An over-sized push is answered with 413 and the socket is reset while
+        // we are still uploading, so the response itself can be cut short. The
+        // status is the thing under test and we already have it.
+        res.on('aborted', finish);
+        res.on('error', finish);
       }
     );
-    // Writing into a socket the server already reset is expected once we have
-    // an answer, so only a pre-response failure is a real error.
+    // Writing into a socket the server already reset is expected once we have an
+    // answer, so only a failure BEFORE the server answered is a real error.
+    // Keying this on `end` instead raced the reset: measured, it failed ~15% of
+    // idle runs and 83% of runs under load, with `read ECONNRESET`.
     req.on('error', (err) => {
-      if (!settled) reject(err);
+      if (response) return finish();
+      if (settled) return undefined;
+      settled = true;
+      return reject(err);
     });
     if (chunks) {
       let i = 0;
       const nextChunk = () => {
-        if (settled) return undefined;
+        if (settled || response) return undefined;
         if (i >= chunks.length) return req.end();
         req.write(chunks[i], () => {});
         i += 1;
@@ -2126,12 +2230,50 @@ test('the packaged extension is small, complete and actually loadable', async ()
 });
 
 test('cancel and bridge commands are safe to call with nothing running', async () => {
-  const handler = vscode.__test.commands.get('aiNotebookLive.cancel');
-  assert.strictEqual(typeof handler, 'function');
-  await handler();
+  // Activates its own extension rather than borrowing the command registry a
+  // test eighty lines up happened to leave behind - which made this fail in
+  // isolation and in reverse order, and meant it asserted nothing on its own.
+  const extension = require(path.join('..', 'extension.js'));
+  newNotebook(['x = 1']);
+  vscode.__test.commands.clear();
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  extension.activate(context);
+  try {
+    // Cancel with no generation, and stop with no bridge: both are things a
+    // user can do at any moment, and neither may throw.
+    for (const id of ['aiNotebookLive.cancel', 'aiNotebookLive.stopBridge']) {
+      const handler = vscode.__test.commands.get(id);
+      assert.strictEqual(typeof handler, 'function', `${id} must be registered`);
+      await handler();
+      // Calling twice is the case that actually bites: the second stop used to
+      // run against a bridge object that was already torn down.
+      await handler();
+    }
+  } finally {
+    await extension.deactivate();
+  }
 });
 
 (async () => {
+  // Two tests used to read state that an earlier test happened to leave behind,
+  // and nothing could have told us: the suite only ever ran in one order. Set
+  // AI_NOTEBOOK_TEST_ORDER=reverse, or shuffle:<seed>, to shake that out.
+  const order = process.env.AI_NOTEBOOK_TEST_ORDER || '';
+  if (order === 'reverse') {
+    tests.reverse();
+    process.stdout.write('  (test order reversed)\n');
+  } else if (order.startsWith('shuffle')) {
+    const seed = Number(order.split(':')[1]) || 1;
+    const rnd = lcg(seed);
+    for (let i = tests.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rnd() * (i + 1));
+      [tests[i], tests[j]] = [tests[j], tests[i]];
+    }
+    process.stdout.write(`  (test order shuffled, seed ${seed})\n`);
+  }
   for (const [name, fn] of tests) {
     try {
       await fn();

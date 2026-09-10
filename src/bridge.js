@@ -9,6 +9,8 @@ const validate = require('./validate');
 const { log } = require('./log');
 
 const MAX_BODY = 1024 * 1024;
+/** How long to keep draining a rejected upload so its status can be delivered. */
+const DRAIN_MS = 2000;
 
 /** An error that knows its own HTTP status, so callers get told the truth. */
 class BridgeError extends Error {
@@ -300,7 +302,11 @@ class Bridge {
       // sitting in the notebook for as long as it hung.
       let writer;
       try {
-        for await (const chunk of req) {
+        // destroyOnReturn: false, because leaving this loop early - which is
+        // exactly what a 413 or a bad character does - would otherwise destroy
+        // the request, and a destroyed request means Node resets the socket
+        // before send() can drain it and deliver the status.
+        for await (const chunk of req.iterator({ destroyOnReturn: false })) {
           size += chunk.length;
           if (size > MAX_BODY) throw new BridgeError('body too large', 413);
           // Per chunk, before anything is written. Node's utf8 decoder joins
@@ -465,17 +471,36 @@ function clampIndex(raw, fallback, count) {
 
 function send(res, status, body) {
   const payload = JSON.stringify(body);
+  const req = res.req;
+  const unread = Boolean(req) && !req.readableEnded && !req.destroyed;
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
   });
   res.end(payload);
+  if (!unread) return;
+  // Ending a response while the request body is still arriving makes Node reset
+  // the socket, and a reset DISCARDS the bytes we just wrote - so the caller got
+  // ECONNRESET instead of the 413 explaining what it did wrong. Draining the
+  // rest lets the close be graceful and the status actually arrive.
+  //
+  // Bounded, so an endless upload cannot hold the connection open: whatever has
+  // not turned up within the window was not going to.
+  req.resume();
+  const giveUp = setTimeout(() => req.destroy(), DRAIN_MS);
+  if (giveUp.unref) giveUp.unref();
+  const done = () => clearTimeout(giveUp);
+  req.once('end', done);
+  req.once('error', done);
+  req.once('close', done);
 }
 
 async function readJson(req) {
   let body = '';
   req.setEncoding('utf8');
-  for await (const chunk of req) {
+  // Same reason as /cell/stream: throwing out of this loop must not destroy the
+  // request, or the 413 never reaches the caller.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     body += chunk;
     if (body.length > MAX_BODY) throw new BridgeError('body too large', 413);
   }
