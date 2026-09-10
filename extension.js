@@ -14,6 +14,11 @@ const {
   invalidateCliCache,
 } = require('./src/provider');
 const { Bridge } = require('./src/bridge');
+const {
+  decideExecution,
+  forgetSessionGrants,
+  activeGrants,
+} = require('./src/policy');
 
 const state = {
   /** @type {vscode.CancellationTokenSource | undefined} */
@@ -23,6 +28,7 @@ const state = {
   lastInstruction: '',
   status: undefined,
   bridge: undefined,
+  providerLabel: '',
   context: undefined,
 };
 
@@ -34,7 +40,7 @@ function activate(context) {
 
   state.bridge = new Bridge({
     resolveNotebook: (hint) => targetNotebook(hint),
-    defaultRun: () => settings().autoRun,
+    decideRun: (req) => decideExecution({ ...req, intent: 'bridge', opts: settings() }),
   });
 
   // The provider probe is cached, so anything that could change its answer has
@@ -54,6 +60,15 @@ function activate(context) {
       ) {
         invalidateCliCache();
       }
+      // Changing the policy is a fresh statement of intent; a stale "allow for
+      // this session" must not survive it.
+      if (
+        e.affectsConfiguration('aiNotebookLive.execution') ||
+        e.affectsConfiguration('aiNotebookLive.bridge.execution')
+      ) {
+        forgetSessionGrants();
+      }
+      if (e.affectsConfiguration('aiNotebookLive')) renderStatus();
     })
   );
 
@@ -102,6 +117,7 @@ function activate(context) {
       `Copied a ready-to-run bridge command (port ${state.bridge.port}).`
     );
   });
+  register('aiNotebookLive.controlPanel', showControlPanel);
   register('aiNotebookLive.showLog', showLog);
 
   // Warm the probe so the first Ctrl+Alt+G costs no I/O.
@@ -112,20 +128,183 @@ function activate(context) {
 }
 
 async function deactivate() {
+  forgetSessionGrants();
   if (state.bridge) await state.bridge.stop();
   disposeLog();
 }
 
 /* ------------------------------- UI plumbing ------------------------------ */
 
-function idle() {
+const MODE_LABEL = { never: 'Never', ask: 'Ask each time', always: 'Always' };
+
+/**
+ * The always-visible half of the control panel.
+ *
+ * Before this the bridge could be listening - accepting code from any local
+ * process - with nothing anywhere in the UI saying so.
+ */
+function renderStatus() {
   const item = state.status;
   if (!item) return;
-  item.text = '$(sparkle) AI Cell';
-  item.tooltip = 'Generate a notebook cell with AI (Ctrl+Alt+G)';
-  item.command = 'aiNotebookLive.generate';
+  const opts = settings();
+  const running = Boolean(state.bridge && state.bridge.running);
+  const armed = opts.execution === 'always' || opts.bridgeExecution === 'always';
+
+  const bits = ['$(sparkle) AI'];
+  if (running) bits.push('$(plug)');
+  if (armed) bits.push('$(play)');
+  item.text = bits.join(' ');
+
+  const md = new vscode.MarkdownString(
+    [
+      '**AI Notebook Live**',
+      '',
+      `Provider: ${state.providerLabel || 'not checked yet'}`,
+      `Agent bridge: ${running ? `listening on 127.0.0.1:${state.bridge.port}` : 'stopped'}`,
+      `Run AI code: **${MODE_LABEL[opts.execution] || opts.execution}**`,
+      `Run agent code: **${MODE_LABEL[opts.bridgeExecution] || opts.bridgeExecution}**`,
+      '',
+      '_Click to open the control panel._',
+    ].join('\n')
+  );
+  item.tooltip = md;
+  item.command = 'aiNotebookLive.controlPanel';
   if (vscode.window.activeNotebookEditor) item.show();
   else item.hide();
+}
+
+// Kept as the name the rest of the file already uses for "not busy".
+function idle() {
+  renderStatus();
+}
+
+async function pickMode(title, current) {
+  const rows = ['never', 'ask', 'always'].map((mode) => ({
+    label: MODE_LABEL[mode],
+    description: mode === current ? '$(check) current' : '',
+    mode,
+  }));
+  const pick = await vscode.window.showQuickPick(rows, { title, placeHolder: title });
+  return pick && pick.mode;
+}
+
+/**
+ * The control panel: one menu that shows what this extension will actually do,
+ * and lets the user change it. A QuickPick rather than a webview on purpose -
+ * it is the command palette, which is the one piece of VS Code UI a beginner
+ * has already been taught, and it stays testable.
+ */
+async function showControlPanel() {
+  const opts = settings();
+  const running = Boolean(state.bridge && state.bridge.running);
+  const grants = activeGrants();
+
+  const rows = [
+    {
+      label: '$(sparkle) Generate a cell with AI',
+      description: 'Ctrl+Alt+G',
+      act: () => vscode.commands.executeCommand('aiNotebookLive.generate'),
+    },
+    {
+      label: '$(play) Run AI-generated code',
+      description: MODE_LABEL[opts.execution],
+      detail: 'What happens after Claude finishes writing a cell for you.',
+      act: async () => {
+        const mode = await pickMode('Run AI-generated code', opts.execution);
+        if (mode) await update('execution', mode);
+      },
+    },
+    {
+      label: '$(shield) Run code pushed in by agents',
+      description: MODE_LABEL[opts.bridgeExecution],
+      detail: 'Applies to cells that arrive over the local bridge from another tool.',
+      act: async () => {
+        const mode = await pickMode('Run code pushed in by agents', opts.bridgeExecution);
+        if (mode) await update('bridge.execution', mode);
+      },
+    },
+    {
+      label: '$(plug) Agent bridge',
+      description: running ? `running on 127.0.0.1:${state.bridge.port}` : 'stopped',
+      detail: running
+        ? 'Any program on this machine holding the token can add cells to this notebook.'
+        : 'Let other AI tools write into this notebook.',
+      act: async () => {
+        if (running) await vscode.commands.executeCommand('aiNotebookLive.stopBridge');
+        else await startBridge(true);
+      },
+    },
+    {
+      label: '$(key) Provider',
+      description: state.providerLabel || 'not checked yet',
+      detail: 'Where generated code comes from.',
+      act: showProviderMenu,
+    },
+    {
+      label: '$(eye) Send cell outputs to the model',
+      description: opts.includeOutputs ? 'On' : 'Off',
+      detail: 'Outputs and error tracebacks from earlier cells are included in the prompt.',
+      act: () => update('includeOutputs', !opts.includeOutputs),
+    },
+    {
+      label: '$(output) Show log',
+      act: () => showLog(),
+    },
+  ];
+
+  if (grants.length) {
+    rows.splice(3, 0, {
+      label: '$(unlock) Approved for this session',
+      description: grants.join(', '),
+      detail: 'Forget these, so you are asked again.',
+      act: () => {
+        forgetSessionGrants();
+        vscode.window.showInformationMessage('AI Notebook Live: session approvals forgotten.');
+      },
+    });
+  }
+
+  const pick = await vscode.window.showQuickPick(rows, {
+    title: 'AI Notebook Live',
+    placeHolder: 'What should this extension be allowed to do?',
+  });
+  if (pick && pick.act) await pick.act();
+  renderStatus();
+}
+
+async function update(key, value) {
+  await vscode.workspace
+    .getConfiguration('aiNotebookLive')
+    .update(key, value, vscode.ConfigurationTarget.Global);
+  renderStatus();
+}
+
+async function showProviderMenu() {
+  let label = state.providerLabel;
+  let problem;
+  try {
+    const target = await resolveProvider(settings(), state.context.secrets);
+    label = target.label;
+    state.providerLabel = label;
+  } catch (err) {
+    problem = (err && err.message) || String(err);
+  }
+  const pick = await vscode.window.showQuickPick(
+    [
+      { label: '$(key) Set an Anthropic API key', act: setApiKey },
+      {
+        label: '$(folder) Set the path to the claude command',
+        act: () =>
+          vscode.commands.executeCommand(
+            'workbench.action.openSettings',
+            'aiNotebookLive.claudePath'
+          ),
+      },
+      { label: '$(output) Show log', act: () => showLog() },
+    ],
+    { title: problem ? `Provider: ${problem}` : `Provider: ${label}` }
+  );
+  if (pick && pick.act) await pick.act();
 }
 
 function busy(label) {
@@ -152,14 +331,21 @@ async function guard(label, body) {
   // overlaps with the user typing their instruction, so it costs nothing. What
   // matters is only that it resolves before anything edits the notebook.
   const provider = resolveProvider(opts, state.context.secrets);
-  provider.catch(() => {});
+  provider.then(
+    (target) => {
+      state.providerLabel = target.label;
+    },
+    () => {
+      state.providerLabel = '';
+    }
+  );
 
   const cts = new vscode.CancellationTokenSource();
   state.active = cts;
   busy(label === 'explain' ? 'explaining' : 'writing');
   vscode.commands.executeCommand('setContext', 'aiNotebookLive.generating', true);
   try {
-    await body({ token: cts.token, opts, provider });
+    await body({ token: cts.token, opts, provider, intent: label });
   } catch (err) {
     await reportError(err);
   } finally {
@@ -296,7 +482,7 @@ async function ask(title, placeHolder) {
 
 /* -------------------------------- commands ------------------------------- */
 
-async function generate(arg, { token, opts, provider }) {
+async function generate(arg, { token, opts, provider, intent }) {
   const editor = requireEditor();
   const notebook = editor.notebook;
   const instruction = await ask(
@@ -309,10 +495,10 @@ async function generate(arg, { token, opts, provider }) {
   const index = notebook.cellCount ? editor.selection.end : 0;
   const { system, user } = prompts.generatePrompt({ notebook, index, instruction, opts });
   const writer = await CellWriter.insert(notebook, index, { kind: 'code' });
-  await pump({ writer, system, user, opts, token, target, run: opts.autoRun });
+  await pump({ writer, system, user, opts, token, target, intent });
 }
 
-async function revise(arg, { token, opts, provider }) {
+async function revise(arg, { token, opts, provider, intent }) {
   const { notebook, cell } = resolveCell(arg);
   const instruction = await ask(
     'Revise this cell',
@@ -323,10 +509,10 @@ async function revise(arg, { token, opts, provider }) {
   const target = await provider;
   const { system, user } = prompts.revisePrompt({ notebook, cell, instruction, opts });
   const writer = await CellWriter.replace(notebook, cell);
-  await pump({ writer, system, user, opts, token, target, run: opts.autoRun });
+  await pump({ writer, system, user, opts, token, target, intent });
 }
 
-async function fixError(arg, { token, opts, provider }) {
+async function fixError(arg, { token, opts, provider, intent }) {
   const { notebook, cell } = resolveCell(arg);
   if (cell.kind !== vscode.NotebookCellKind.Code) {
     throw new Error('that is a markdown cell - there is nothing to fix.');
@@ -343,10 +529,10 @@ async function fixError(arg, { token, opts, provider }) {
   const target = await provider;
   const { system, user } = prompts.fixPrompt({ notebook, cell, opts });
   const writer = await CellWriter.replace(notebook, cell);
-  await pump({ writer, system, user, opts, token, target, run: opts.autoRun });
+  await pump({ writer, system, user, opts, token, target, intent });
 }
 
-async function explain(arg, { token, opts, provider }) {
+async function explain(arg, { token, opts, provider, intent }) {
   const { notebook, cell } = resolveCell(arg);
   const target = await provider;
   const { system, user } = prompts.explainPrompt({ notebook, cell, opts });
@@ -354,7 +540,7 @@ async function explain(arg, { token, opts, provider }) {
     kind: 'markdown',
     fenced: false,
   });
-  await pump({ writer, system, user, opts, token, target, run: false });
+  await pump({ writer, system, user, opts, token, target, intent, requested: false });
 }
 
 /** The directory the `claude` CLI should run in: the notebook's own project. */
@@ -365,7 +551,7 @@ function workingDirFor(notebook) {
 }
 
 /** Runs one streaming request and lands every token in the cell as it arrives. */
-async function pump({ writer, system, user, opts, token, run, target }) {
+async function pump({ writer, system, user, opts, token, target, intent, requested }) {
   const started = Date.now();
   opts = { ...opts, cwd: workingDirFor(writer.notebook) };
   let result;
@@ -407,8 +593,13 @@ async function pump({ writer, system, user, opts, token, run, target }) {
   }
 
   const text = writer.produced() ? await writer.end() : '';
-  if (text.trim() && run && !result.cancelled && !result.refused) {
-    await runCell(writer.notebook, writer.index);
+  // One gate for every execution in the extension. `fixError` used to bypass
+  // the user's setting entirely by hard-coding run:true, which mattered because
+  // its prompt is built from cell outputs - text an attacker can influence.
+  if (text.trim() && !result.cancelled && !result.refused) {
+    const decision = await decideExecution({ intent, requested, preview: text, opts });
+    log(`execution: ${decision.run ? 'ran' : 'did not run'} - ${decision.reason}`);
+    if (decision.run) await runCell(writer.notebook, writer.index);
   }
 
   const seconds = ((Date.now() - started) / 1000).toFixed(1);

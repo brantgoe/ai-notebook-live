@@ -102,6 +102,20 @@ class WorkspaceEdit {
   }
 }
 
+class MarkdownString {
+  constructor(value = '') {
+    this.value = value;
+    this.isTrusted = false;
+    this.supportThemeIcons = false;
+  }
+  appendMarkdown(v) {
+    this.value += v;
+    return this;
+  }
+}
+
+const ConfigurationTarget = { Global: 1, Workspace: 2, WorkspaceFolder: 3 };
+
 class CancellationTokenSource {
   constructor() {
     this.listeners = [];
@@ -158,6 +172,7 @@ const workspace = {
   }),
   onDidChangeConfiguration: () => ({ dispose() {} }),
   getWorkspaceFolder: () => undefined,
+  isTrusted: true,
   async applyEdit(edit) {
     registry.edits += 1;
     // Opt-in hooks for tests: failure injection and a deterministic yield so
@@ -196,6 +211,14 @@ const window = {
   createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
   createStatusBarItem: () => ({ text: '', tooltip: '', command: '', show() {}, hide() {}, dispose() {} }),
   onDidChangeActiveNotebookEditor: () => ({ dispose() {} }),
+  showQuickPick: async (items, options) => {
+    registry.shown.push({ kind: 'quickpick', items, options });
+    if (!registry.picks.length) return undefined;
+    const wanted = registry.picks.shift();
+    const list = await items;
+    // A test names the row it wants by a substring of its label.
+    return list.find((i) => String(i.label).includes(wanted));
+  },
   showInputBox: async (options) => {
     registry.shown.push({ kind: 'input', options });
     return registry.inputs.length ? registry.inputs.shift() : undefined;
@@ -232,6 +255,8 @@ module.exports = {
   NotebookCellData,
   NotebookEdit,
   NotebookRange,
+  MarkdownString,
+  ConfigurationTarget,
   NotebookDocument,
   WorkspaceEdit,
   Range,

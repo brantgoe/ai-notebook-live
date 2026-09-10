@@ -28,9 +28,11 @@ function defaultInfoDir() {
  * Requests must carry the token written to ~/.ai-notebook-live/bridge.json.
  */
 class Bridge {
-  constructor({ resolveNotebook, defaultRun, infoDir }) {
+  constructor({ resolveNotebook, decideRun, infoDir }) {
     this.resolveNotebook = resolveNotebook;
-    this.defaultRun = defaultRun;
+    // Asks the shared execution policy. A bridge caller can decline execution
+    // but can never demand it - that escalation was the whole bug.
+    this.decideRun = decideRun || (async () => ({ run: false, reason: 'no policy configured' }));
     this.infoDir = infoDir || defaultInfoDir();
     this.infoFile = path.join(this.infoDir, 'bridge.json');
     this.server = undefined;
@@ -182,13 +184,29 @@ class Bridge {
 
   async closeWriter(writer, options) {
     const raw = options.run !== undefined ? options.run : options.search.get('run');
-    const run = raw === undefined || raw === null ? this.defaultRun() : truthy(raw);
+    // undefined means "no opinion", which lets the user's setting decide.
+    // An explicit false is honoured; an explicit true is only a request.
+    const requested = raw === undefined || raw === null ? undefined : truthy(raw);
     const text = await writer.end();
-    // Execution is a separate decision from writing; phase 4 routes this
-    // through the shared policy so a caller cannot escalate past the user.
-    const ran = Boolean(run && text.trim());
-    if (ran) await runCell(writer.notebook, writer.index);
-    return { ok: true, index: writer.index, characters: text.length, ran };
+    const decision = await this.decideRun({
+      requested,
+      preview: text,
+      // Never hold an HTTP socket open waiting for a human to answer a dialog.
+      blocking: false,
+      onLateApproval: async () => {
+        const cell = writer.cell();
+        if (cell) await runCell(writer.notebook, cell.index);
+      },
+    });
+    if (decision.run) await runCell(writer.notebook, writer.index);
+    return {
+      ok: true,
+      index: writer.index,
+      characters: text.length,
+      ran: Boolean(decision.run),
+      pending: Boolean(decision.pending),
+      reason: decision.reason,
+    };
   }
 }
 

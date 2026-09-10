@@ -2,7 +2,7 @@
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
   "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let external AI agents push cells in live over a localhost bridge.",
-  "version": "0.1.1",
+  "version": "0.2.0-dev.1",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {
@@ -87,6 +87,12 @@
         "command": "aiNotebookLive.showLog",
         "title": "Show Log",
         "category": "AI Notebook"
+      },
+      {
+        "command": "aiNotebookLive.controlPanel",
+        "title": "Control Panel",
+        "category": "AI Notebook",
+        "icon": "$(settings-gear)"
       }
     ],
     "keybindings": [
@@ -157,7 +163,8 @@
             "Always use the local `claude` CLI (uses your existing Claude Code login, no API key needed)."
           ],
           "default": "auto",
-          "description": "Where generated code comes from."
+          "description": "Where generated code comes from.",
+          "scope": "machine-overridable"
         },
         "aiNotebookLive.model": {
           "type": "string",
@@ -194,7 +201,9 @@
         "aiNotebookLive.autoRun": {
           "type": "boolean",
           "default": false,
-          "description": "Execute a generated code cell automatically once streaming finishes."
+          "scope": "machine",
+          "markdownDeprecationMessage": "Replaced by `#aiNotebookLive.execution#`. Your existing value is still honoured: true becomes \"always\", false becomes \"never\".",
+          "description": "Deprecated. Use aiNotebookLive.execution."
         },
         "aiNotebookLive.systemPromptExtra": {
           "type": "string",
@@ -209,18 +218,52 @@
         "aiNotebookLive.bridge.autoStart": {
           "type": "boolean",
           "default": false,
-          "description": "Start the localhost agent bridge automatically when a notebook is opened."
+          "description": "Start the localhost agent bridge automatically when a notebook is opened.",
+          "scope": "machine"
         },
         "aiNotebookLive.bridge.port": {
           "type": "number",
           "default": 37417,
-          "description": "Port for the localhost agent bridge. Use 0 to pick a free port."
+          "description": "Port for the localhost agent bridge. Use 0 to pick a free port.",
+          "scope": "machine"
         },
         "aiNotebookLive.claudePath": {
           "type": "string",
           "default": "",
           "scope": "machine",
           "markdownDescription": "Absolute path to the `claude` executable. Leave empty to search the usual locations. Run `which claude` in a terminal to find it.\n\nMachine-scoped: a workspace cannot set this, because the value is executed."
+        },
+        "aiNotebookLive.execution": {
+          "type": "string",
+          "enum": [
+            "never",
+            "ask",
+            "always"
+          ],
+          "default": "ask",
+          "scope": "machine",
+          "enumDescriptions": [
+            "Write the code into the cell, but never run it.",
+            "Ask before running each generated cell.",
+            "Run every generated code cell as soon as it finishes."
+          ],
+          "description": "Whether AI-generated code may run in your kernel."
+        },
+        "aiNotebookLive.bridge.execution": {
+          "type": "string",
+          "enum": [
+            "never",
+            "ask",
+            "always"
+          ],
+          "default": "never",
+          "scope": "machine",
+          "enumDescriptions": [
+            "Agents may add cells, but never run them.",
+            "Ask before running a cell an agent pushed in.",
+            "Run cells pushed in by local agents automatically."
+          ],
+          "description": "Whether code pushed in by an external agent over the local bridge may run in your kernel."
         }
       }
     }
@@ -237,5 +280,18 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/brantgoe/ai-notebook-live"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In an untrusted folder, generated code is never executed, the agent bridge does not start, and prompt text supplied by the workspace is ignored.",
+      "restrictedConfigurations": [
+        "aiNotebookLive.systemPromptExtra"
+      ]
+    },
+    "virtualWorkspaces": {
+      "supported": "limited",
+      "description": "The Claude Code CLI provider and the local agent bridge both need a real filesystem."
+    }
   }
 }
