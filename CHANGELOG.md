@@ -7,6 +7,69 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.3.0] — 2026-09-09
+
+Adversarial testing of 0.2.0 found thirteen bugs; mapping the code to fix them
+found eleven more. This release is those fixes. Two things stop happening: the
+extension silently losing what the model wrote, and silently overwriting what
+*you* wrote.
+
+### Fixed — the ones you would have noticed
+
+- **Typing into a cell while the AI is writing no longer destroys your text.**
+  The AI stops and leaves your version alone, and offers to put its own version
+  in a new cell below. It never overwrites you.
+- **Code the model wrote is no longer silently dropped.** Fence-stripping was
+  conservative while streaming — correct, since text withdrawn from a cell is
+  text deleted in front of you — but nothing ever told it the stream had
+  finished, so the guess became permanent. A cell containing only `` `x` ``, an
+  R name like `` `my var` <- 5 ``, a fence inside a docstring, or a fenced block
+  inside another all lost content. The `` `x` `` case was the worst: the result
+  was empty, so the cell was removed and *nothing happened at all*.
+- **`nbpush` no longer hangs forever** when run in a terminal with nothing piped
+  in — and no longer parks an empty cell in your notebook while it waits.
+- **An empty generation says so**, instead of reporting "AI wrote 1 lines" for a
+  cell it just deleted.
+
+### Fixed — correctness and safety
+
+- `--run` and `--no-run` together used to run the cell. Contradictory arguments
+  are now refused rather than resolved last-wins, which matters for a flag that
+  decides whether code executes in your kernel. `--code --run` no longer eats
+  the flag as a value. Added `--kind` and `--dry-run`.
+- A `notebook=` hint matching nothing wrote to whatever notebook was active. It
+  is now a `409` that lists what is open.
+- Markdown pushed over the bridge had its fenced code blocks stripped.
+- The request body was spread into the options bag, so any key a caller invented
+  became an option and body keys beat the query string. Options now come from
+  the query string only, so a body key *cannot* become one.
+- A `null` body surfaced as a `500` with an internal JavaScript message in it.
+- An empty push left an empty cell behind.
+- A fractional `position` reached the notebook API; `?kind=Markdown` silently
+  became a code cell; a `language` value reached VS Code with no coercion.
+- The execution policy threw on a non-string preview and on missing settings,
+  despite promising it never throws — and a throw there escaped the HTTP
+  handler.
+- An **unrecognised caller inherited your `execution` setting**, so an unknown
+  surface could run code under `always`. It now fails closed, as does a typo in
+  the setting itself.
+- `end()` after a cell was abandoned could resurrect the discarded partial and
+  overwrite the restored original.
+
+### Changed
+
+- **The bridge is stricter**, which is why this is 0.3.0 and not 0.2.1. Requests
+  it used to accept and guess at are now refused with a reason. Options must be
+  in the query string.
+- `nbpush` prints the notebook it wrote to, on stderr — stdout stays JSON.
+
+### Internal
+
+- 69 tests, up from 44. Fence handling is fuzzed across 50,000 adversarial
+  strings asserting that text once written is never retracted.
+- `src/validate.js` is the one place input is coerced; it depends on nothing,
+  and a test enforces that.
+
 ## [0.2.0] — 2026-09-09
 
 The theme of this release is that the extension can no longer do two things

@@ -29,7 +29,7 @@ needs VS Code's `NotebookEdit` API, which is what this extension uses.
 
 1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
 2. ```bash
-   code --install-extension ai-notebook-live-0.2.0.vsix
+   code --install-extension ai-notebook-live-0.3.0.vsix
    ```
 3. Reload the window.
 
@@ -138,8 +138,16 @@ POST /cell          {"code": "..."} in one shot
 POST /cell/stream   raw body, streamed into the cell as it arrives
 ```
 
-Query parameters: `kind=markdown`, `position=below|above|end|<index>`,
-`run=0|1`, `notebook=<path fragment>`.
+Query parameters — and only the query string: `kind=code|markdown`,
+`position=below|above|end|<whole number>`, `run=0|1`,
+`notebook=<path fragment>`, `language=<kernel language>`. The body carries the
+content and nothing else.
+
+The bridge refuses rather than guesses. `400` for a body that is not a JSON
+object, a body that produces no content, an unrecognised `kind`, or a
+`position` that is not a whole number. `409` when no notebook is open, or when
+`notebook=` matches none of the open ones — it will not quietly write somewhere
+else. `413` for a body over 1 MiB.
 
 ### Security
 
@@ -194,6 +202,9 @@ except the provider you chose, for a request you triggered.
 - Undo granularity follows the stream: `Ctrl+Z` steps back through it rather
   than reverting a whole generation in one go. If a revision *fails*, your
   original is restored in a single step.
+- If you type into a cell while it is being written, the AI stops and leaves
+  your version alone — but a keystroke landing in the same instant as a write
+  can still be lost.
 
 ## Development
 
