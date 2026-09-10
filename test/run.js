@@ -728,6 +728,76 @@ test('nbpush looks for the bridge where the bridge actually writes it', () => {
   );
 });
 
+/* -------------------------------- MCP ------------------------------------ */
+
+const mcp = require(path.join('..', 'bin', 'mcp-server.js'));
+
+test('the MCP server describes tools an agent can actually use', () => {
+  const names = mcp.TOOLS.map((t) => t.name).sort();
+  assert.deepStrictEqual(names, ['add_notebook_cell', 'get_notebook_status']);
+  for (const tool of mcp.TOOLS) {
+    assert.ok(tool.description.length > 40, `${tool.name} needs a description worth reading`);
+    assert.strictEqual(tool.inputSchema.type, 'object');
+  }
+  const add = mcp.TOOLS.find((t) => t.name === 'add_notebook_cell');
+  assert.deepStrictEqual(add.inputSchema.required, ['code']);
+  // The description has to say WHY, not just what: an agent that edits the
+  // .ipynb on disk instead will silently lose the user's work.
+  assert.match(add.description, /already open|on disk/i);
+});
+
+test('the MCP server speaks enough of the protocol to be driven', async () => {
+  const sent = [];
+  const realWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    sent.push(String(chunk).trim());
+    return true;
+  };
+  try {
+    await mcp.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+    await mcp.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    await mcp.handle({ jsonrpc: '2.0', id: 3, method: 'ping' });
+    // A notification carries no id and must never be answered.
+    await mcp.handle({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  } finally {
+    process.stdout.write = realWrite;
+  }
+  assert.strictEqual(sent.length, 3, 'a notification must not be replied to');
+  const init = JSON.parse(sent[0]).result;
+  assert.strictEqual(init.protocolVersion, '2024-11-05');
+  assert.ok(init.capabilities.tools, 'it must advertise tools');
+  assert.strictEqual(init.serverInfo.name, 'ai-notebook-live');
+  assert.strictEqual(JSON.parse(sent[1]).result.tools.length, 2);
+});
+
+test('an MCP tool failure comes back as a result the model can read', async () => {
+  // Not as a protocol error: the agent should be told the bridge is not running
+  // and be able to act on it, rather than seeing a transport fault.
+  const sent = [];
+  const realWrite = process.stdout.write;
+  const saved = process.env.AI_NOTEBOOK_LIVE_HOME;
+  process.env.AI_NOTEBOOK_LIVE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'no-bridge-'));
+  process.stdout.write = (chunk) => {
+    sent.push(String(chunk).trim());
+    return true;
+  };
+  try {
+    await mcp.handle({
+      jsonrpc: '2.0',
+      id: 9,
+      method: 'tools/call',
+      params: { name: 'get_notebook_status', arguments: {} },
+    });
+  } finally {
+    process.stdout.write = realWrite;
+    process.env.AI_NOTEBOOK_LIVE_HOME = saved;
+  }
+  const msg = JSON.parse(sent[0]);
+  assert.ok(msg.result, 'a tool failure is a result, not a JSON-RPC error');
+  assert.strictEqual(msg.result.isError, true);
+  assert.match(msg.result.content[0].text, /bridge is not running|Start Local Agent Bridge/i);
+});
+
 /* ------------------------------ the CLI provider ------------------------- */
 
 const providerCli = require(path.join('..', 'src', 'provider.js'));

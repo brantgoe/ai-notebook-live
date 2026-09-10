@@ -1,8 +1,8 @@
 {
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
-  "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let external AI agents push cells in live over a localhost bridge.",
-  "version": "0.3.2",
+  "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let other AI tools \u2014 Codex included \u2014 add cells to the notebook you have open.",
+  "version": "0.4.0",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {
@@ -91,6 +91,11 @@
         "title": "Control Panel",
         "category": "AI Notebook",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "aiNotebookLive.copyAgentSetup",
+        "title": "Copy Setup Command for Another AI Tool",
+        "category": "AI Notebook"
       }
     ],
     "keybindings": [
@@ -139,6 +144,9 @@
         },
         {
           "command": "aiNotebookLive.controlPanel"
+        },
+        {
+          "command": "aiNotebookLive.copyAgentSetup"
         }
       ]
     },

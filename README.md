@@ -29,7 +29,7 @@ needs VS Code's `NotebookEdit` API, which is what this extension uses.
 
 1. Download the `.vsix` from [Releases](https://github.com/brantgoe/ai-notebook-live/releases).
 2. ```bash
-   code --install-extension ai-notebook-live-0.3.2.vsix
+   code --install-extension ai-notebook-live-0.4.0.vsix
    ```
 3. Reload the window.
 
@@ -150,6 +150,35 @@ object, a body that produces no content, an unrecognised `kind`, or a
 `notebook=` matches none of the open ones — it will not quietly write somewhere
 else. `413` for a body over 1 MiB.
 
+## Letting other AI tools write here
+
+The bridge is also exposed as an **MCP server**, so a tool that speaks MCP can
+add cells to your open notebook as a first-class action rather than by being
+told to run a shell command.
+
+This matters most for **Codex**, whose extension edits notebooks *on disk* — and
+a `.ipynb` written on disk does not appear in a tab you already have open, and
+is overwritten the moment you save. Going through the bridge edits the live
+document instead.
+
+Run **AI Notebook: Copy Setup Command for Another AI Tool** (or the matching row
+in the control panel) and paste what it gives you:
+
+```bash
+codex mcp add ai-notebook -- node <path to bin/mcp-server.js>
+```
+
+Then restart Codex. It gets two tools:
+
+| tool | what it does |
+|---|---|
+| `get_notebook_status` | which notebook is targeted, and how many cells it has |
+| `add_notebook_cell` | adds a cell, live — `code`/`markdown`, a position, and an optional request to run it |
+
+Start the bridge before asking Codex to write. Whether an agent-written cell
+*executes* is still governed by `aiNotebookLive.bridge.execution`, which defaults
+to `never` — an agent can ask, and never override you.
+
 ### Security
 
 - **Loopback only.** The listener binds `127.0.0.1` and is never exposed.
@@ -197,9 +226,11 @@ except the provider you chose, for a request you triggered.
 - Writes into the notebook **currently open in VS Code**. It does not edit files
   on disk, and cannot help with a notebook that is closed.
 - Running cells needs the Jupyter extension and a live kernel.
-- **The Claude Code CLI provider does not work on Windows yet** — the CLI is
+- **The Claude Code CLI provider is not supported on Windows.** The CLI is
   installed there as a `.cmd`, which this extension neither finds nor launches
-  correctly. Use an Anthropic API key on Windows for now.
+  correctly, and the obvious fix (`shell: true`) would turn a launch problem
+  into a shell-injection surface. Windows users should use an Anthropic API key.
+  Everything else — including the bridge and the MCP server — works there.
 - `maxTokens`, `effort` and `refusalFallback` apply to the API provider only.
 - On models with extended thinking there can be a pause before any text appears;
   the status bar shows a spinner while it works.
@@ -214,7 +245,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 76 tests, no VS Code needed
+npm test          # 79 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

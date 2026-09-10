@@ -6,6 +6,7 @@
 **
 !dist/extension.js
 !bin/nbpush.js
+!bin/mcp-server.js
 !package.json
 !README.md
 !CHANGELOG.md

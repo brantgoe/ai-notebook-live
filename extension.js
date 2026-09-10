@@ -121,6 +121,7 @@ function activate(context) {
       `Copied a ready-to-run bridge command (port ${state.bridge.port}).`
     );
   });
+  register('aiNotebookLive.copyAgentSetup', copyAgentSetup);
   register('aiNotebookLive.controlPanel', showControlPanel);
   register('aiNotebookLive.showLog', showLog);
 
@@ -251,6 +252,12 @@ async function showControlPanel() {
       act: () => update('includeOutputs', !opts.includeOutputs),
     },
     {
+      label: '$(plug) Let another AI tool write here',
+      description: 'Codex, or anything that speaks MCP',
+      detail: 'Copies the one-line command that registers this notebook as a tool.',
+      act: copyAgentSetup,
+    },
+    {
       label: '$(output) Show log',
       act: () => showLog(),
     },
@@ -281,6 +288,33 @@ async function update(key, value) {
     .getConfiguration('aiNotebookLive')
     .update(key, value, vscode.ConfigurationTarget.Global);
   renderStatus();
+}
+
+/**
+ * Hands another AI tool the one line it needs to be able to write cells here.
+ *
+ * The path has to be resolved at runtime: it lives inside the installed
+ * extension directory, which carries the version number and therefore changes
+ * on every upgrade. Nobody should be typing it from memory.
+ */
+async function copyAgentSetup() {
+  const server = state.context.asAbsolutePath(path.join('bin', 'mcp-server.js'));
+  const line = `codex mcp add ai-notebook -- node ${JSON.stringify(server)}`;
+  const pick = await vscode.window.showInformationMessage(
+    'Register this notebook with an AI tool that speaks MCP, so it can add cells here directly.',
+    'Copy command for Codex',
+    'Show the path'
+  );
+  if (pick === 'Copy command for Codex') {
+    await vscode.env.clipboard.writeText(line);
+    vscode.window.showInformationMessage(
+      'Copied. Run it in a terminal, then restart Codex. Start the bridge before asking it to write.'
+    );
+  }
+  if (pick === 'Show the path') {
+    await vscode.env.clipboard.writeText(server);
+    vscode.window.showInformationMessage(`Copied the server path: ${server}`);
+  }
 }
 
 async function showProviderMenu() {

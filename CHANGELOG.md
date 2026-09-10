@@ -7,6 +7,34 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.4.0] — 2026-09-09
+
+### Added
+
+- **Other AI tools can now write cells into your open notebook.** The bridge is
+  exposed as an MCP server, so anything that speaks MCP — **Codex** in
+  particular — gets `add_notebook_cell` and `get_notebook_status` as real tools
+  rather than shell instructions it has to remember.
+
+  This is worth having because the Codex extension edits notebooks *on disk*,
+  and a file written on disk does not appear in a tab you already have open — it
+  is lost the moment you save. Going through the bridge edits the live document.
+
+  Run **AI Notebook: Copy Setup Command for Another AI Tool**, paste the line it
+  gives you, and restart Codex. Whether an agent-written cell *runs* is still
+  governed by `aiNotebookLive.bridge.execution`, which defaults to `never`: an
+  agent can ask, and can never override you.
+
+  The server ships as a single file importing only Node builtins — no SDK, no
+  new dependency, nothing added to the bundle.
+
+### Changed
+
+- **Windows is explicitly out of scope for the Claude Code CLI provider.** It
+  was already broken there and is now documented as a limitation rather than
+  tracked as a bug. Windows users should use an Anthropic API key; the bridge
+  and the MCP server work fine there.
+
 ## [0.3.2] — 2026-09-09
 
 A second round of adversarial testing, aimed at the `claude` CLI provider, which
