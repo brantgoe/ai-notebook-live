@@ -3,6 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # Releases are cut by pushing a tag, so the workflow has to listen for one.
+    # The release job below gates on refs/tags/v*, which never fired while this
+    # trigger only matched branches.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
