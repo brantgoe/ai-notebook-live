@@ -3,7 +3,7 @@ const path = require('path');
 const vscode = require('vscode');
 const { settings } = require('./src/config');
 const { log, show: showLog, dispose: disposeLog } = require('./src/log');
-const { CellWriter, readOutputs, runCell } = require('./src/notebook');
+const { CellWriter, readOutputs, runCell, runApproved } = require('./src/notebook');
 const prompts = require('./src/prompt');
 const {
   stream,
@@ -45,6 +45,13 @@ function activate(context) {
         .filter((d) => !d.isClosed)
         .map((d) => path.basename(d.uri.fsPath)),
     decideRun: (req) => decideExecution({ ...req, intent: 'bridge', opts: settings() }),
+    // The bridge has no vscode of its own, so anything the user needs to see -
+    // a cell an agent overwrote, an approval that no longer matched - comes back
+    // out through here.
+    notify: (kind, message) => {
+      if (kind === 'warning') vscode.window.showWarningMessage(message);
+      else vscode.window.showInformationMessage(message);
+    },
   });
 
   // The provider probe is cached, so anything that could change its answer has
@@ -752,13 +759,35 @@ async function pump({ writer, system, user, opts, token, target, intent, request
       throw err;
     }
   }
+  // The user typed into the cell mid-stream, so the writer stopped and end()
+  // returned the DOCUMENT - which is their text, not the model's. Everything
+  // below assumes `text` came from the model, so none of it applies.
+  //
+  // This is the gate the 0.3.0 ownership work existed to make possible, and it
+  // was never wired up: `foreign` was set and then read by nothing outside the
+  // test suite. Measured, with execution 'always': the user's own half-typed
+  // line was executed in their kernel. Under 'ask' the modal showed them their
+  // own code and asked whether to run "this newly generated code".
+  if (writer.foreign) {
+    log('execution: did not run - the cell was edited while it was being written');
+    vscode.window.showInformationMessage(
+      'AI Notebook Live: you edited that cell while it was being written, so the AI stopped and kept your version. ' +
+        'Nothing was run.'
+    );
+    return;
+  }
+
   // One gate for every execution in the extension. `fixError` used to bypass
   // the user's setting entirely by hard-coding run:true, which mattered because
   // its prompt is built from cell outputs - text an attacker can influence.
   if (text.trim() && !result.cancelled && !result.refused) {
     const decision = await decideExecution({ intent, requested, preview: text, opts });
     log(`execution: ${decision.run ? 'ran' : 'did not run'} - ${decision.reason}`);
-    if (decision.run) await runCell(writer.notebook, writer.index);
+    // Checked against what was approved, not just which cell: a bridge caller
+    // can rewrite the cell while an 'ask' dialog is open.
+    if (decision.run && !(await runApproved(writer.notebook, writer.index, text))) {
+      log(`execution declined: cell ${writer.index} changed before it could run`);
+    }
   }
 
   const seconds = ((Date.now() - started) / 1000).toFixed(1);

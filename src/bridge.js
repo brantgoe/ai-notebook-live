@@ -4,7 +4,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { CellWriter, editorFor, runCell, readOutputs, cellKindName } = require('./notebook');
+const {
+  CellWriter,
+  editorFor,
+  runCell,
+  runApproved,
+  readOutputs,
+  cellKindName,
+} = require('./notebook');
 const validate = require('./validate');
 const { log } = require('./log');
 
@@ -39,9 +46,13 @@ function defaultInfoDir() {
  * Requests must carry the token written to ~/.ai-notebook-live/bridge.json.
  */
 class Bridge {
-  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks }) {
+  constructor({ resolveNotebook, decideRun, infoDir, listNotebooks, notify }) {
     this.resolveNotebook = resolveNotebook;
     this.listNotebooks = listNotebooks;
+    // This module deliberately does not import vscode - it is the one piece
+    // that can be driven headlessly, and a test asserts as much. Anything the
+    // user needs to SEE goes out through here instead.
+    this.notify = notify || (() => {});
     // Asks the shared execution policy. A bridge caller can decline execution
     // but can never demand it - that escalation was the whole bug.
     this.decideRun = decideRun || (async () => ({ run: false, reason: 'no policy configured' }));
@@ -274,6 +285,26 @@ class Bridge {
       // Handed back so the caller - and the user reading a log - can see what
       // was destroyed. Ctrl+Z also restores it, but only if somebody noticed.
       const previous = cell.document.getText();
+
+      // An optional precondition on what the caller believes it is replacing.
+      //
+      // A read from /cells is clipped at 4000 characters, and nothing stopped a
+      // caller reconstructing a clipped cell and writing the truncation back
+      // over the real thing. Indices also shift under a live editor, so "cell 7"
+      // at read time need not be cell 7 now. Optional in 0.6.0 and required
+      // later, so existing callers keep working while they are updated.
+      const expect = url.searchParams.get('expect');
+      if (expect !== null && expect !== previous) {
+        throw new BridgeError(
+          `cell ${at} does not contain what you expected, so it was not replaced. ` +
+            'Read it again and retry if you still want to.',
+          409
+        );
+      }
+      if (expect === null) {
+        log(`replace: cell ${at} rewritten with no expect= precondition`);
+      }
+
       const writer = await CellWriter.replace(notebook, cell);
       try {
         writer.write(code);
@@ -283,6 +314,15 @@ class Bridge {
         // and the fix changed no existing test, which is why it survived.
         await requireProduced(writer, 'replace');
         const text = await writer.end();
+        // A cell changing under the user's cursor used to leave NO trace at all:
+        // no log line, nothing on screen. The only evidence was the text itself
+        // being different, and Ctrl+Z only helps somebody who noticed.
+        log(`replace: cell ${at} in ${path.basename(notebook.uri.fsPath)} - ` +
+          `${previous.length} chars replaced with ${text.length}`);
+        this.notify(
+          'info',
+          `An agent rewrote cell ${at} of ${path.basename(notebook.uri.fsPath)}. Ctrl+Z undoes it.`
+        );
         return send(res, 200, {
           ok: true,
           notebook: notebook.uri.fsPath,
@@ -374,10 +414,21 @@ class Bridge {
         language: cell.document.languageId,
         source: clipped ? `${text.slice(0, LIMIT)}\n...<truncated>` : text,
       };
+      // Per cell, not just once for the whole response. A caller deciding
+      // whether it may safely rewrite cell 7 needs to know about CELL 7, and a
+      // response-level flag set by some other cell tells it nothing. This is the
+      // read half of the same hazard `expect=` guards on the write half.
+      if (clipped) out.truncated = true;
       if (wantOutputs) {
         const seen = readOutputs(cell);
         if (seen.error) out.error = seen.error;
         if (seen.text) out.output = seen.text;
+        // Outputs are clipped too, and that never set the flag at all - so a
+        // response could carry "...<truncated>" while claiming nothing was.
+        if (seen.truncated) {
+          out.truncated = true;
+          truncated = true;
+        }
       }
       return out;
     });
@@ -443,10 +494,24 @@ class Bridge {
       blocking: false,
       onLateApproval: async () => {
         const cell = writer.cell();
-        if (cell) await runCell(writer.notebook, cell.index);
+        if (!cell) return;
+        // What was approved, not merely which cell. The dialog can be open for
+        // as long as the user takes to read it, and another request can rewrite
+        // that cell in the meantime - so the code being run here is checked
+        // against the code that was actually shown.
+        if (!(await runApproved(writer.notebook, cell.index, text))) {
+          log(`late approval declined: cell ${cell.index} changed after it was shown`);
+          this.notify(
+            'warning',
+            'AI Notebook Live: that cell changed while the approval was open, so it was not run. ' +
+              'Look at it and run it yourself if you still want to.'
+          );
+        }
       },
     });
-    if (decision.run) await runCell(writer.notebook, writer.index);
+    if (decision.run && !(await runApproved(writer.notebook, writer.index, text))) {
+      log(`execution declined: cell ${writer.index} changed before it could run`);
+    }
     return {
       ok: true,
       // Which notebook it actually landed in. nbpush echoes this, and it is what

@@ -166,12 +166,30 @@ const TOOLS = [
       'Rewrite the contents of one existing cell, in place, by index. Use this to correct a ' +
       'cell you added — appending a second, fixed copy leaves the wrong one behind. ' +
       'This DESTROYS what was there, so read the cell first and be sure of the index; the ' +
-      'previous contents come back in the response.',
+      'previous contents come back in the response. ' +
+      'Always pass "expect" with the exact source you last read for that index: a person is ' +
+      'editing this notebook while you work, so indices shift and contents change under you, ' +
+      'and without it you are guessing. If the cell you read came back with truncated:true you ' +
+      'do not have its full source — read a narrower range first, because writing back a ' +
+      'truncated copy would delete the rest of the cell.',
     inputSchema: {
       type: 'object',
       properties: {
-        index: { type: 'number', description: 'The index of the cell to rewrite.' },
+        index: { type: 'integer', minimum: 0, description: 'The index of the cell to rewrite.' },
         code: { type: 'string', description: 'The new contents of the cell.' },
+        expect: {
+          type: 'string',
+          description:
+            'The exact current source of that cell, as you last read it. The replace is ' +
+            'refused if the cell no longer matches, rather than destroying something you ' +
+            'have not seen.',
+        },
+        notebook: {
+          type: 'string',
+          description:
+            'Part of the path of the notebook you read, so a replace cannot land in a ' +
+            'different file if the user switches tabs between your read and your write.',
+        },
       },
       required: ['index', 'code'],
     },
@@ -206,14 +224,19 @@ async function callTool(name, args) {
     if (res.status !== 200) throw new Error(`could not read the notebook (${res.status}): ${res.text}`);
     const d = JSON.parse(res.text);
     const body = d.cells
-      .map((c) => `--- cell ${c.index} (${c.kind}) ---\n${c.source}` +
+      // Marked per cell. "Some cells were clipped" told an agent that something
+      // somewhere was incomplete but not WHICH, which is no use to one deciding
+      // whether it may safely rewrite this particular index.
+      .map((c) => `--- cell ${c.index} (${c.kind})${c.truncated ? ' [TRUNCATED - not the full source]' : ''} ---\n${c.source}` +
         (c.error ? `\n[error] ${c.error}` : '') +
         (c.output ? `\n[output] ${c.output}` : ''))
       .join('\n\n');
     return (
       `${d.notebook} has ${d.count} cells; showing ${d.cells.length} from index ${d.from}.` +
-      (d.truncated ? ' Some cells were clipped.' : '') +
-      `\n\n${body}`
+      (d.truncated
+        ? ' Cells marked TRUNCATED are incomplete - do not replace one from what you see here.'
+        : '') +
+      `\n\nWhen replacing any of these, pass expect= with the exact source shown above.\n\n${body}`
     );
   }
 
@@ -222,9 +245,14 @@ async function callTool(name, args) {
     if (typeof args.code !== 'string' || !args.code.trim()) {
       throw new Error('code is required and must be a non-empty string');
     }
+    const search = new URLSearchParams({ index: String(args.index) });
+    // Both optional on the wire, so an older caller still works - but passing
+    // them is what turns "replace cell 7" from a guess into a checked edit.
+    if (typeof args.expect === 'string') search.set('expect', args.expect);
+    if (typeof args.notebook === 'string' && args.notebook) search.set('notebook', args.notebook);
     const res = await request(info, {
       pathname: '/cell/replace',
-      search: `index=${encodeURIComponent(args.index)}`,
+      search: search.toString(),
       body: JSON.stringify({ code: args.code }),
     });
     if (res.status !== 200) throw new Error(`the bridge refused this edit (${res.status}): ${res.text}`);

