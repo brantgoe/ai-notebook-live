@@ -410,6 +410,80 @@ test('settings are clamped, so a bad value cannot become a bad request', async (
   c.clear();
 });
 
+/* -------------------------------- nbpush -------------------------------- */
+
+const nbpush = require(path.join('..', 'bin', 'nbpush.js'));
+
+test('nbpush refuses to hang on a terminal instead of waiting forever', () => {
+  // Run with nothing piped in, nbpush used to block on stdin indefinitely - and
+  // the bridge had already put an empty cell in the notebook by then.
+  const refused = nbpush.chooseInput({}, { isTTY: true });
+  assert.strictEqual(refused.kind, 'refuse');
+  assert.match(refused.message, /no input/i);
+  assert.match(refused.message, /--code/, 'and it says what to do instead');
+
+  // Piped in, it still streams.
+  assert.strictEqual(nbpush.chooseInput({}, { isTTY: false }).kind, 'stdin');
+  // Explicit input wins over both.
+  assert.strictEqual(nbpush.chooseInput({ code: 'x' }, { isTTY: true }).kind, 'literal');
+  assert.strictEqual(nbpush.chooseInput({ file: 'a.py' }, { isTTY: true }).kind, 'file');
+});
+
+test('nbpush rejects contradictory arguments instead of quietly picking one', () => {
+  const rejected = [];
+  const realWrite = process.stderr.write;
+  const realExit = process.exit;
+  process.stderr.write = () => true;
+  process.exit = (code) => {
+    const err = new Error(`exit ${code}`);
+    err.exitCode = code;
+    throw err;
+  };
+  try {
+    for (const argv of [
+      ['--run', '--no-run'], //          decides whether code runs in your kernel
+      ['--no-run', '--run'],
+      ['--code', 'a', '--code', 'b'],
+      ['--code', '--run'], //            used to set code to "--run" and eat the flag
+      ['--code', 'x', 'file.py'],
+      ['--kind', 'banana'],
+      ['--position'], //                 missing value
+      ['--nope'],
+    ]) {
+      let threw = false;
+      try {
+        nbpush.parseArgs(argv);
+      } catch (err) {
+        threw = err.exitCode === 2;
+      }
+      if (!threw) rejected.push(argv.join(' '));
+    }
+  } finally {
+    process.stderr.write = realWrite;
+    process.exit = realExit;
+  }
+  assert.deepStrictEqual(rejected, [], 'these argument combinations must be refused');
+});
+
+test('nbpush accepts the arguments it should', () => {
+  assert.deepStrictEqual(nbpush.parseArgs(['--code', 'print(1)']).code, 'print(1)');
+  assert.strictEqual(nbpush.parseArgs(['--markdown']).kind, 'markdown');
+  assert.strictEqual(nbpush.parseArgs(['--kind', 'markdown']).kind, 'markdown');
+  assert.strictEqual(nbpush.parseArgs([]).kind, 'code');
+  assert.strictEqual(nbpush.parseArgs(['--no-run']).run, false);
+  assert.strictEqual(nbpush.parseArgs(['--run']).run, true);
+  assert.strictEqual(nbpush.parseArgs(['analysis.py']).file, 'analysis.py');
+});
+
+test('nbpush looks for the bridge where the bridge actually writes it', () => {
+  // These disagreed: the bridge honoured AI_NOTEBOOK_LIVE_HOME and nbpush did
+  // not, so the suite could not drive nbpush without clobbering a real bridge.
+  assert.ok(
+    nbpush.INFO_FILE.startsWith(BRIDGE_HOME),
+    `nbpush points at ${nbpush.INFO_FILE}, which is not under ${BRIDGE_HOME}`
+  );
+});
+
 /* -------------------------------- policy -------------------------------- */
 
 const policyModule = require(path.join('..', 'src', 'policy.js'));
@@ -704,6 +778,36 @@ test('an over-sized push is rejected and leaves no half-written cell behind', as
     assert.strictEqual(after.status, 200);
     assert.strictEqual(notebook.cellCount, 2);
     assert.strictEqual(notebook.cellAt(1).document.getText(), 'print("still working")');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a stream that never sends a byte leaves no cell behind', async () => {
+  // The writer used to be opened on the headers, so a client that connected and
+  // then stalled - nbpush waiting on stdin that never arrived - parked an empty
+  // cell in the notebook for as long as it hung.
+  const notebook = newNotebook(['seed = 1']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const res = await call(port, token, { path: '/cell/stream?position=end', chunks: [] });
+    assert.strictEqual(res.status, 400);
+    assert.match(res.body, /empty/);
+    assert.strictEqual(notebook.cellCount, 1, 'no cell may be created for an empty push');
+
+    // A real push still works, and says where it went.
+    const ok = await call(port, token, {
+      path: '/cell/stream?position=end',
+      chunks: ['print(', '"hi")'],
+    });
+    assert.strictEqual(ok.status, 200);
+    assert.strictEqual(notebook.cellCount, 2);
+    assert.strictEqual(JSON.parse(ok.body).notebook, notebook.uri.fsPath);
   } finally {
     await bridge.stop();
   }

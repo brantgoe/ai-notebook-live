@@ -234,23 +234,31 @@ class Bridge {
     if (url.pathname === '/cell/stream') {
       // The request body is streamed straight into the cell, so a piped
       // generator shows up in the notebook as it produces text.
-      const writer = await this.openWriter({ search: url.searchParams });
       req.setEncoding('utf8');
       let size = 0;
+      // Deliberately not opened until the first byte arrives. Opening on the
+      // headers meant a client that connected and then stalled - nbpush on a
+      // terminal, waiting for stdin that never came - left an empty cell
+      // sitting in the notebook for as long as it hung.
+      let writer;
       try {
         for await (const chunk of req) {
           size += chunk.length;
           if (size > MAX_BODY) throw new BridgeError('body too large', 413);
+          if (!writer) writer = await this.openWriter({ search: url.searchParams });
           writer.write(chunk);
         }
       } catch (err) {
         // The push failed, so take the half-written cell back out. Note the
         // status comes from the error: a client that hung up is a 400, not the
         // 413 every failure in this loop used to report.
-        await writer.abandon();
+        if (writer) await writer.abandon();
         return send(res, (err && err.status) || 400, {
           error: String((err && err.message) || err),
         });
+      }
+      if (!writer) {
+        return send(res, 400, { error: 'nothing to insert: the request body was empty' });
       }
       return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
     }
@@ -292,6 +300,9 @@ class Bridge {
     if (decision.run) await runCell(writer.notebook, writer.index);
     return {
       ok: true,
+      // Which notebook it actually landed in. nbpush echoes this, and it is what
+      // makes a mis-targeted push visible instead of silent.
+      notebook: writer.notebook.uri.fsPath,
       index: writer.index,
       characters: text.length,
       ran: Boolean(decision.run),
