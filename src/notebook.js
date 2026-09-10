@@ -10,14 +10,36 @@ const FLUSH_MS = 60;
 let insertLock = Promise.resolve();
 
 /**
- * Removes markdown code fences from a partially streamed response.
- * Models sometimes wrap cell code in ```python ... ``` despite instructions, and
- * we only ever see a prefix of the answer, so this has to be prefix-stable:
- * the same text must never be emitted and then retracted.
+ * Removes markdown code fences from a model's answer.
+ *
+ * Two modes, because the question is genuinely different at the two times we ask
+ * it. MID-STREAM we have only ever seen a prefix, so the answer must be
+ * conservative and above all prefix-stable: text already written into the cell
+ * must never be retracted, because setText is a full reconcile and a retraction
+ * DELETES characters the user can already see.
+ *
+ * AT THE END the ambiguity is resolvable, and staying conservative starts
+ * costing real content - `x` in R, a fence inside a triple-quoted string, a
+ * fenced block nested inside another. Final mode is provably an EXTENSION of
+ * what streaming emitted, never a contradiction of it: every position final
+ * treats as a closing fence is also matched by streaming's /(^|\n)```/, so
+ * final's candidates are a SUBSET of streaming's - and streaming takes the
+ * first where final takes the last, so final's answer can only be longer.
+ * The fuzzer in test/run.js checks both directions.
+ *
+ * Deliberately NOT normalised in final mode: a trailing \r from CRLF input
+ * stays, because removing a byte streaming already emitted would be a
+ * retraction. Do not "clean that up".
+ *
+ * Policy where the two readings genuinely cannot be told apart - two separate
+ * fenced blocks look exactly like one block containing a fence: FAIL LOUD,
+ * NEVER LOSE CONTENT. Stray fence markers in a cell are an obvious syntax
+ * error; a silently discarded half of the answer is not.
  */
-function unfence(raw) {
+function unfence(raw, { final = false } = {}) {
   const lead = raw.replace(/^\s+/, '');
   if (!lead) return '';
+  if (final) return unfenceFinal(lead);
   // An opening fence may still be arriving ("`", "``", "```pyth"). Emit nothing
   // until we know whether it is a fence and which language tag it carries.
   if (/^`{1,3}[^\n]*$/.test(lead)) return '';
@@ -28,6 +50,30 @@ function unfence(raw) {
   // No closing fence yet: hold back a tail that could turn out to be one,
   // because text already written into the cell must never be retracted.
   return afterOpen.replace(/(?:^|\n)`{0,2}$/, '');
+}
+
+function unfenceFinal(lead) {
+  // The answer is only fenced if its FIRST line is an opener. This is the branch
+  // that used to swallow `x` and `my var` <- 5 whole: a single backtick is not a
+  // fence, and at the end there is no "it might still become one".
+  const open = /^(`{3,})[^\n]*(\n|$)/.exec(lead);
+  if (!open) return lead;
+  if (!open[2]) return ''; // an opener and nothing after it
+  const body = lead.slice(open[0].length);
+  // The closer is the LAST line that is nothing but the marker - or more of it,
+  // which CommonMark allows. Taking the FIRST one truncated at any fence the
+  // code itself contained, which is how a docstring lost its second half.
+  const closer = new RegExp(`(^|\\n)${open[1]}\`*[ \\t\\r]*(?=\\n|$)`, 'g');
+  let at = -1;
+  let m = closer.exec(body);
+  while (m !== null) {
+    at = m.index;
+    closer.lastIndex = m.index + 1; // candidates may overlap
+    m = closer.exec(body);
+  }
+  // Never closed: hand back everything rather than guess. This branch is what
+  // makes final an extension of streaming rather than a contradiction of it.
+  return at === -1 ? body : body.slice(0, at);
 }
 
 function notebookLanguage(notebook) {
@@ -88,7 +134,7 @@ class CellWriter {
 
   /** True once the model has produced text worth keeping. */
   produced() {
-    return this.text().trim().length > 0;
+    return this.text({ final: true }).trim().length > 0;
   }
 
   static async insert(notebook, index, { kind = 'code', language, fenced = true } = {}) {
@@ -189,8 +235,8 @@ class CellWriter {
     return this.flushing;
   }
 
-  text() {
-    const body = this.fenced ? unfence(this.raw) : this.raw;
+  text({ final = false } = {}) {
+    const body = this.fenced ? unfence(this.raw, { final }) : this.raw;
     return body.replace(/^\n+/, '');
   }
 
@@ -230,7 +276,9 @@ class CellWriter {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    const final = trim ? this.text().replace(/\s+$/, '') : this.text();
+    const final = trim
+      ? this.text({ final: true }).replace(/\s+$/, '')
+      : this.text({ final: true });
     // Assigned back into the chain so the final write is serialised with the
     // flushes, instead of racing them.
     this.flushing = this.flushing.then(() => this.setText(final, { force: true }));
@@ -258,7 +306,7 @@ class CellWriter {
       this.timer = undefined;
     }
     await this.flushing.catch(() => {});
-    const partial = this.text();
+    const partial = this.text({ final: true });
     const cell = this.cell();
     if (!cell) return { restored: false, partial };
 

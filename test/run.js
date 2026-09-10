@@ -167,6 +167,66 @@ test('unfence handles every fence shape we have actually seen', () => {
   }
 });
 
+/**
+ * What final mode makes of the same shapes. Compare with FENCE_SHAPES above:
+ * every row that changed is a bug that used to lose the user's content.
+ */
+const FINAL_SHAPES = [
+  ['plain fenced block', '```python\nprint(1)\n```', 'print(1)'],
+  ['no fence at all', 'print(1)\n', 'print(1)\n'],
+  ['fence inside a markdown body', 'text\n```python\nx=1\n```', 'text\n```python\nx=1\n```'],
+  // FIXED: used to truncate at the fence inside the string.
+  ['fence inside a docstring', '```python\ns = """\n```\nstill\n"""\n```', 's = """\n```\nstill\n"""'],
+  // FIXED: used to return '' and the cell was then dropped entirely.
+  ['backtick-quoted R name', '`my var` <- 5', '`my var` <- 5'],
+  ['inline code only', '`x`', '`x`'],
+  ['nested fences', '````markdown\n```python\nprint(1)\n```\n````', '```python\nprint(1)\n```'],
+  // Genuinely empty, so '' is the right answer.
+  ['empty fence pair', '```\n```', ''],
+  ['unterminated fence', '```python\nprint(1)\nprint(2)', 'print(1)\nprint(2)'],
+  ['trailing prose after a fence', '```python\nprint(1)\n```\nand prose', 'print(1)'],
+  // Accepted regression: indistinguishable from a fence inside a string, so we
+  // keep everything and let the syntax error be visible rather than lose half.
+  ['two separate blocks', '```python\nA\n```\n```python\nB\n```', 'A\n```\n```python\nB'],
+  // The stray \r is deliberate: dropping it would retract a byte we streamed.
+  ['CRLF line endings', '```python\r\nprint(1)\r\n```', 'print(1)\r'],
+];
+
+test('unfence resolves at the end what streaming had to leave ambiguous', () => {
+  for (const [name, raw, expected] of FINAL_SHAPES) {
+    assert.strictEqual(unfence(raw, { final: true }), expected, `${name}: ${JSON.stringify(raw)}`);
+  }
+});
+
+test('final mode never contradicts what streaming already wrote', () => {
+  // The property that makes the whole two-mode design safe. Streaming may only
+  // ever be extended by the final answer, never rolled back.
+  for (const seed of [1, 20260909, 777771, 424242]) {
+    for (const raw of fuzzStrings(seed, 12500)) {
+      const resolved = unfence(raw, { final: true });
+      for (let i = 1; i <= raw.length; i += 1) {
+        const streamed = unfence(raw.slice(0, i));
+        assert.ok(
+          resolved.startsWith(streamed),
+          `seed ${seed}: ${JSON.stringify(raw)} streamed ${JSON.stringify(streamed)} at ` +
+            `${i}, which final mode contradicts with ${JSON.stringify(resolved)}`
+        );
+      }
+    }
+  }
+});
+
+test('an opening fence still emits nothing while it is arriving', () => {
+  // The sibling of the streaming assertion above: the two modes are pinned side
+  // by side so the distinction stays visible.
+  for (const partial of ['`', '``', '```', '```py', '```python']) {
+    assert.strictEqual(unfence(partial), '', `streaming: ${JSON.stringify(partial)}`);
+  }
+  assert.strictEqual(unfence('`', { final: true }), '`', 'but at the end a backtick is content');
+  assert.strictEqual(unfence('```', { final: true }), '', 'an opener with no body is empty');
+  assert.strictEqual(unfence('```python', { final: true }), '');
+});
+
 /* ------------------------------ CellWriter ------------------------------ */
 
 test('insert streams chunks into a new cell and strips fences', async () => {
@@ -233,6 +293,38 @@ test('empty generations leave an empty cell the caller can drop', async () => {
   const text = await writer.end();
   assert.strictEqual(text, '');
   assert.strictEqual(vscode.__test.executed.length, 0, 'must not execute an empty cell');
+});
+
+test('a backtick-quoted name is written, not silently swallowed', async () => {
+  // The user-visible bug: `x` unfenced to '', produced() said nothing had been
+  // produced, abandon() removed the cell, and NOTHING HAPPENED. Worst on R
+  // kernels, where backticks quote identifiers.
+  const notebook = newNotebook(['seed = 1']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  for (const chunk of ['`my ', 'var` ', '<- 5']) {
+    writer.write(chunk);
+    await writer.flush();
+  }
+  assert.ok(writer.produced(), 'the model plainly produced something');
+  const text = await writer.end();
+  assert.strictEqual(text, '`my var` <- 5');
+  assert.strictEqual(notebook.cellAt(1).document.getText(), '`my var` <- 5');
+});
+
+test('produced, end and abandon all agree about what the model produced', async () => {
+  // These three must read the stream the same way. If produced() resolved the
+  // ambiguity but end() did not, a cell would survive the empty-drop and then
+  // be written as ''.
+  const notebook = newNotebook(['seed = 1']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  writer.write('`x`');
+  assert.ok(writer.produced(), 'produced() sees content');
+  assert.strictEqual(await writer.end(), '`x`', 'and end() writes the same content');
+
+  const second = await CellWriter.insert(notebook, 2, { kind: 'code' });
+  second.write('`x`');
+  const { partial } = await second.abandon();
+  assert.strictEqual(partial, '`x`', 'and abandon() hands back the same content');
 });
 
 test('a failed replace hands the cell back exactly as it was', async () => {
