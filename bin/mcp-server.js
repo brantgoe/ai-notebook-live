@@ -315,6 +315,10 @@ async function handle(msg) {
   const { id, method, params } = msg;
   // Notifications carry no id and must never be answered.
   if (id === undefined) return;
+  // A null id is reserved for a server's answer to a request it could not
+  // parse; a client MUST NOT send one. It was being answered as though it were
+  // a real id, which is harmless today and wrong per spec.
+  if (id === null) return fail(null, 'a request id must not be null', INVALID_REQUEST);
 
   if (method === 'initialize') {
     return reply(id, {

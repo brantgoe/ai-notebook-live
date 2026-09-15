@@ -7,6 +7,71 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.6.1] - 2026-09-15
+
+The fourteen findings from the 0.5.0 review that 0.6.0 left open. I had said
+everything was addressed; it was not, and checking the code rather than the
+memory of it is what turned this up. Three were rated P2 by the panel.
+
+### Fixed — your work
+
+- **A write that had succeeded could be undone by an unrelated later failure.**
+  If anything threw after the final write landed — the bridge answering a
+  client that had already hung up was enough — the recovery path reverted it:
+  a replace rolled back, an inserted cell deleted. A committed write is now the
+  user's, and nothing takes it back.
+- **A keystroke landing while a write was in flight spliced the two texts
+  together** and left the writer believing nothing had happened, so it kept
+  going. The document is now checked after each write lands; a mismatch is
+  treated as the edit it is, streaming stops, and you are told.
+- With `bridge.port: 0`, starting the bridge in a second window silently
+  **unlinked the first window's advertisement**, leaving that bridge listening
+  but unreachable — the exact failure the code's own comment said had been fixed.
+  A live advertisement belonging to another process is now refused, with the
+  pid named.
+
+### Fixed — talking to other tools
+
+- `nbpush --health`, `--list` and the copied example command all **sent the
+  token before checking** that the listener was the bridge — the same leak the
+  main path was fixed for. Every path probes anonymously first now, and the
+  copied command is `nbpush` rather than raw `curl`.
+- `nbpush --dry-run` failed outright with no bridge. It now previews offline.
+- `/cells` had no cap on the number of cells, so one authenticated request
+  could pull a multi-megabyte response. It pages at 200 and says where to resume.
+- The 1 MiB body limit counted UTF-16 code units, not bytes, so it accepted
+  ~3 MB of CJK. It counts bytes, as the README says.
+- A `text/plain` or form-encoded body was JSON-parsed regardless. It is `415` now.
+- Terminal escapes — IPython colours its tracebacks — flowed out through
+  `/cells` untouched into whatever rendered the result. Outputs are cleaned;
+  source is left verbatim because `expect=` has to match it.
+- A cell whose only output was an HTML table, markdown, or JSON contributed
+  nothing to *Fix the Error*. Those are read now; HTML comes through as text.
+- The Claude Code CLI stopping early *after* writing some text was reported as
+  a clean finish. It now warns that the cell may be cut off, as the API path
+  always did.
+- A JSON-RPC request with a `null` id was answered as though it were real.
+
+### Fixed — smaller
+
+- The Anthropic SDK was loaded on every activation for users who never use it;
+  it loads on first API use.
+- On a remote (SSH, Codespaces, a container) the MCP setup command put a
+  remote path on your local clipboard. It says so now, and that the other tool
+  has to run on the remote too.
+- A generation that timed out with no output was reported as your cancellation.
+- `provider` can no longer be forced by an untrusted workspace.
+- The output channel could leak if stopping the bridge threw during shutdown.
+
+### Internal
+
+125 tests, up from 113. Every fix above was mutation-tested. Two of the new
+tests were wrong on the first attempt — one deadlocked the runner by standing
+up a server on the event loop and then blocking that loop with `spawnSync` —
+and the mutation harness itself silently tested unmutated code on its first run
+because a shell helper dropped its arguments. Both are recorded here because
+the point of this whole exercise is that green means what it says.
+
 ## [0.6.0] - 2026-09-10
 
 A ten-expert review of 0.5.0 — security, VS Code platform, concurrency, test
@@ -392,3 +457,13 @@ behind your back: destroy your code, or run code you did not agree to run.
 
 Initial version: stream Claude-generated code into notebook cells, revise,
 explain and fix cells, and a localhost bridge for external agents.
+
+[0.6.1]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/brantgoe/ai-notebook-live/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/brantgoe/ai-notebook-live/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/brantgoe/ai-notebook-live/compare/5d3a051ff20f...v0.2.0
+[0.1.0]: https://github.com/brantgoe/ai-notebook-live/commit/5d3a051ff20f275053583424adfac24cdd042351

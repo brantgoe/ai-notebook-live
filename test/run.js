@@ -1158,11 +1158,12 @@ test('a malformed frame is answered, not silently dropped', async () => {
     await mcp.handle({ jsonrpc: '2.0', id: 3, method: 'resources/list' });
     await mcp.handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'no_such_tool' } });
     await mcp.handle({ jsonrpc: '2.0', id: 5, method: 'tools/call' });
+    await mcp.handle({ jsonrpc: '2.0', id: null, method: 'ping' });
   } finally {
     process.stdout.write = realWrite;
   }
   const frames = sent.join('').trim().split('\n').map((l) => JSON.parse(l));
-  assert.strictEqual(frames.length, 3, 'every request with an id gets exactly one answer');
+  assert.strictEqual(frames.length, 4, 'every request with an id gets exactly one answer');
   // -32601 is how a client feature-detects an optional method; -32000 tells it
   // the server broke instead, which is a different thing.
   assert.strictEqual(frames[0].error.code, -32601, 'unknown method');
@@ -1172,6 +1173,9 @@ test('a malformed frame is answered, not silently dropped', async () => {
     'a typo must not be reported as VS Code not being ready'
   );
   assert.strictEqual(frames[2].error.code, -32602, 'missing params.name');
+  // A null id is reserved for answering an unparseable request; a client MUST
+  // NOT send one, and it was being answered as though it were a real id.
+  assert.strictEqual(frames[3].error.code, -32600, 'a null id is an invalid request');
 });
 
 test('the bridge says which version it is and what it can do', async () => {
@@ -1281,6 +1285,7 @@ function fakeClaude(scenario) {
       '  if (s === "hang") return;',
       '  if (s === "in_band_failure") return out({ type: "result", subtype: "error_max_turns", result: "ran out of turns" }, () => process.exit(0));',
       '  if (s === "quiet_success") return process.exit(0);',
+      '  if (s === "partial_then_max_turns") return delta("def f():\\n    return ", () => out({ type: "result", subtype: "error_max_turns", result: "ran out of turns" }, () => process.exit(0)));',
       // Emits characters a kernel cannot run: NUL, a raw ESC, and a lone
       // surrogate - the last being what makes an .ipynb unreadable to nbformat.
       '  if (s === "poison") return delta("x = 1\\u0000\\u001b[31m\\u00a0y = 2\\ud800", () => out({ type: "result", subtype: "success" }, () => process.exit(0)));',
@@ -1892,6 +1897,280 @@ test('owns() notices a re-indent, not only a trailing space', async () => {
   await writer.flush();
   assert.ok(writer.foreign, 'a re-indent is a person editing, not an autosave');
   assert.strictEqual(notebook.cellAt(0).document.getText(), 'def f():\n\treturn 2');
+});
+
+test('a committed write is not rolled back by a later failure', async () => {
+  // abandon() undid the write if anything threw AFTER end() had landed it. The
+  // bridge's send() on a socket the client had already closed was enough to
+  // revert a replace that had succeeded, or delete a correctly inserted cell.
+  const notebook = newNotebook(['orig']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('new');
+  const text = await writer.end();
+  assert.strictEqual(text, 'new');
+  const undone = await writer.abandon();
+  assert.strictEqual(undone.committed, true, 'abandon says the write already stood');
+  assert.strictEqual(undone.restored, false);
+  assert.strictEqual(notebook.cellAt(0).document.getText(), 'new', 'the committed text stays');
+});
+
+test('a writer whose cell vanished is finished with, not half-alive', async () => {
+  // abandon() returned early without releasing when the cell was gone, so
+  // `released` was not a sink: a later end() threw a different error from the
+  // one meant for an abandoned writer, and abandon() itself was re-entrant.
+  const notebook = newNotebook(['a', 'b']);
+  const writer = await CellWriter.insert(notebook, 1, { kind: 'code' });
+  writer.write('x');
+  await writer.flush();
+  // The user deletes the cell out from under it.
+  notebook.cells.splice(1, 1);
+  const r = await writer.abandon();
+  assert.strictEqual(r.restored, false);
+  assert.ok(writer.released, 'released must be a terminal state');
+  await assert.rejects(() => writer.end(), /abandoned/);
+});
+
+test('a keystroke inside the applyEdit window is detected, not spliced in', async () => {
+  // The range for a write is computed from the document as read, and applied
+  // against the document as it is when the edit LANDS. A keystroke in between
+  // shifts the coordinates, and the two texts were spliced together with
+  // `foreign` left false - measured: "AI VERSIONID-APPLY". The old owns()
+  // comment said "it stops; it never reverts"; it did neither.
+  const notebook = newNotebook(['start']);
+  const writer = await CellWriter.replace(notebook, notebook.cellAt(0));
+  writer.write('AI VERSION');
+  vscode.__test.onBeforeApply = async () => {
+    vscode.__test.onBeforeApply = null;
+    // onBeforeApply is awaited, so this lands while the edit is in flight.
+    notebook.cellAt(0).document.text = 'USER TYPED MID-APPLY';
+  };
+  try {
+    await writer.flush();
+  } finally {
+    vscode.__test.onBeforeApply = null;
+  }
+  assert.ok(writer.foreign, 'a write that did not land as intended is a foreign edit');
+  // And the writer must now stop rather than keep splicing.
+  const before = notebook.cellAt(0).document.getText();
+  writer.write(' MORE');
+  await writer.flush();
+  assert.strictEqual(notebook.cellAt(0).document.getText(), before, 'no further writes land');
+});
+
+test('a second window cannot clobber a live bridge advertisement', async () => {
+  // writeExclusive unlinked whatever was at the path on EEXIST, reasoning that
+  // it could not be a live bridge because listen() would have failed first.
+  // True on a fixed port; false for bridge.port 0, where this window gets a
+  // fresh port and the other is alive on its own - leaving it listening but
+  // unreachable, the exact failure the module comment says was fixed once.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-notebook-live-clobber-'));
+  const file = path.join(dir, 'bridge.json');
+  // Another live process - this one, under a different token - owns the file.
+  fs.writeFileSync(file, JSON.stringify({ port: 1, token: 'theirs', pid: process.ppid }));
+  const bridge = new Bridge({
+    resolveNotebook: () => newNotebook(['x']),
+    decideRun: async () => ({ run: false, reason: 'test' }),
+    infoDir: dir,
+  });
+  await assert.rejects(() => bridge.start(0), /already advertises a bridge/);
+  assert.strictEqual(
+    JSON.parse(fs.readFileSync(file, 'utf8')).token,
+    'theirs',
+    'the live advertisement is untouched'
+  );
+  assert.ok(!bridge.running, 'and this bridge did not stay up unreachable');
+  // A DEAD pid is stale, and stale files still get replaced.
+  fs.writeFileSync(file, JSON.stringify({ port: 1, token: 'stale', pid: 2 ** 22 - 1 }));
+  await bridge.start(0);
+  assert.notStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).token, 'stale');
+  await bridge.stop();
+});
+
+test('the body limit is a byte limit, as documented', async () => {
+  // size += chunk.length counted UTF-16 code units after setEncoding('utf8'),
+  // so the documented 1 MiB accepted ~3 MB of CJK on the wire.
+  const notebook = newNotebook(['x']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    // 400k three-byte characters: 400k code units, 1.2 MB of bytes.
+    const body = JSON.stringify({ code: '中'.repeat(400000) });
+    const res = await call(port, token, { path: '/cell?position=end', body });
+    assert.strictEqual(res.status, 413, `${Buffer.byteLength(body)} bytes must be refused`);
+    assert.strictEqual(notebook.cellCount, 1);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a JSON endpoint says so when handed something else', async () => {
+  const notebook = newNotebook(['x']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const wrong = await call(port, token, {
+      path: '/cell?position=end',
+      body: 'code=x%3D1',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    });
+    assert.strictEqual(wrong.status, 415);
+    assert.strictEqual(notebook.cellCount, 1);
+    // No header at all is forgiven - curl users rarely set one.
+    const bare = await call(port, token, { path: '/cell?position=end', body: '{"code":"y=2"}' });
+    assert.strictEqual(bare.status, 200);
+    // HEAD is a read.
+    const head = await call(port, token, { method: 'HEAD', path: '/health' });
+    assert.strictEqual(head.status, 200);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('/cells pages a large notebook instead of dumping it', async () => {
+  // Per-cell clipping bounded each cell and nothing bounded the count, so one
+  // authenticated GET could force a multi-megabyte response.
+  const notebook = newNotebook(Array.from({ length: 450 }, (_, i) => `c${i}`));
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const first = JSON.parse((await call(port, token, { method: 'GET', path: '/cells' })).body);
+    assert.strictEqual(first.cells.length, 200);
+    assert.strictEqual(first.more, true);
+    assert.strictEqual(first.next, 200, 'and says where to resume');
+    const last = JSON.parse(
+      (await call(port, token, { method: 'GET', path: `/cells?from=${first.next + 200}` })).body
+    );
+    assert.strictEqual(last.cells.length, 50);
+    assert.ok(!last.more);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('outputs come back without terminal escapes, and HTML reprs as text', async () => {
+  // IPython colours its tracebacks, so notebooks acquire raw ESC legitimately.
+  // cellText refused them inbound; outbound they flowed untouched into whatever
+  // rendered the MCP result. And a cell whose only output was an HTML table
+  // contributed nothing at all.
+  const cell = {
+    outputs: [
+      {
+        items: [
+          { mime: 'application/vnd.code.notebook.stderr', data: Buffer.from('\x1b[31mred\x1b[0m warning\x1b]0;title\x07') },
+          { mime: 'text/html', data: Buffer.from('<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>') },
+          { mime: 'text/markdown', data: Buffer.from('**bold**') },
+        ],
+      },
+    ],
+  };
+  const seen = readOutputs(cell);
+  assert.ok(!/\x1b/.test(seen.text), `no ESC may survive: ${JSON.stringify(seen.text)}`);
+  assert.match(seen.text, /red warning/);
+  assert.match(seen.text, /a\tb\n1\t2/, 'the table survives as text');
+  assert.match(seen.text, /\*\*bold\*\*/);
+});
+
+test('the CLI stopping early after some text is reported, not called a clean finish', async () => {
+  // Half a function and then error_max_turns resolved as stopReason end_turn
+  // with no warning. The API path's max_tokens toast could never fire for the
+  // CLI because its stop reason was hard-coded.
+  await withFakeClaude('partial_then_max_turns', async (binary) => {
+    const result = await providerCli.stream({
+      target: { kind: 'cli', binary, label: 'fake' },
+      system: 's',
+      user: 'u',
+      opts: { ...OPTS, model: 'm' },
+      token: new vscode.CancellationTokenSource().token,
+      onText: () => {},
+    });
+    assert.strictEqual(result.stopReason, 'max_turns');
+  });
+});
+
+test('loading the provider does not load the Anthropic SDK', () => {
+  // The SDK is the bulk of the bundle, and a CLI-only user paid its module
+  // initialisation on every notebook open for a path they never take.
+  const sdk = require.resolve('@anthropic-ai/sdk');
+  assert.ok(
+    !require.cache[sdk],
+    'the SDK must be required lazily, inside the API path, not at module load'
+  );
+});
+
+/**
+ * Runs bin/nbpush.js as a child and resolves with its exit status and output.
+ * Async on purpose: spawnSync blocks this event loop, and a test that stands
+ * up its own HTTP server on this loop then cannot answer the child - which is
+ * exactly how the impostor test deadlocked, with nbpush waiting on a response
+ * the test runner was frozen and unable to send.
+ */
+function runNbpush(args, home) {
+  return new Promise((resolve) => {
+    const child = require('child_process').spawn(
+      process.execPath,
+      [path.join(__dirname, '..', 'bin', 'nbpush.js'), ...args],
+      { env: { ...process.env, AI_NOTEBOOK_LIVE_HOME: home }, stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+test('nbpush --health never hands the token to a listener that is not the bridge', async () => {
+  // --health and --list sent the token before the anonymous probe - the same
+  // exfiltration the main push path was fixed for. A plain HTTP server standing
+  // in for "whatever owns the port" must never see the header.
+  const seen = [];
+  const impostor = http.createServer((req, res) => {
+    seen.push(req.headers['x-ai-notebook-token']);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  await new Promise((r) => impostor.listen(0, '127.0.0.1', r));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-notebook-live-impostor-'));
+  fs.writeFileSync(
+    path.join(dir, 'bridge.json'),
+    JSON.stringify({ port: impostor.address().port, token: 'SECRET', pid: process.pid })
+  );
+  try {
+    for (const flag of ['--health', '--list']) {
+      const r = await runNbpush([flag], dir);
+      assert.notStrictEqual(r.status, 0, `${flag} must refuse a listener that is not the bridge`);
+      assert.match(r.stderr, /not the AI Notebook bridge/);
+    }
+    assert.ok(
+      seen.every((t) => t === undefined),
+      `the impostor must never receive the token, saw: ${JSON.stringify(seen)}`
+    );
+  } finally {
+    impostor.close();
+  }
+});
+
+test('nbpush --dry-run works with no bridge at all', async () => {
+  // readInfo() and confirmBridge() both ran before the dry-run branch, so
+  // previewing offline was impossible - "dry" did not mean dry. And readInfo
+  // called process.exit itself, so nothing upstream could have caught it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-notebook-live-nobridge-'));
+  const r = await runNbpush(['--dry-run', '--code', 'x = 1', '--markdown'], dir);
+  assert.strictEqual(r.status, 0, `dry run must succeed offline: ${r.stderr}`);
+  assert.match(r.stderr, /would add a markdown cell/);
+  assert.match(r.stderr, /target:\s+unknown/);
 });
 
 test('a hung CLI is given up on instead of wedging the extension', async () => {
@@ -2926,6 +3205,13 @@ test('activate registers exactly the commands the manifest contributes', async (
   const registered = [...vscode.__test.commands.keys()].sort();
   const contributed = manifest.contributes.commands.map((c) => c.command).sort();
   assert.deepStrictEqual(registered, contributed);
+  // `provider` is machine-overridable, so a cloned repository could force
+  // claude-cli on an unsuspecting user; restricting it in untrusted folders is
+  // what stops that.
+  assert.ok(
+    manifest.capabilities.untrustedWorkspaces.restrictedConfigurations.includes('aiNotebookLive.provider'),
+    'the provider setting must be ignored in an untrusted workspace'
+  );
   for (const binding of manifest.contributes.keybindings) {
     assert.ok(contributed.includes(binding.command), `keybinding for unknown ${binding.command}`);
   }
@@ -3149,28 +3435,31 @@ test('the packaged extension is small, complete and actually loadable', async ()
   // redistributing it without its licence.
   const { packagesFrom } = require(path.join('..', 'scripts', 'licenses.js'));
   const metafilePath = path.join(root, 'dist', 'metafile.json');
-  if (fs.existsSync(metafilePath)) {
-    const notices = fs.readFileSync(path.join(root, 'THIRD-PARTY-NOTICES.md'), 'utf8');
-    for (const pkg of packagesFrom(JSON.parse(fs.readFileSync(metafilePath, 'utf8')))) {
-      assert.ok(notices.includes(pkg), `${pkg} is bundled but absent from THIRD-PARTY-NOTICES.md`);
-    }
+  // Asserted, not guarded. `if (existsSync)` meant the whole notices check
+  // silently did nothing when the build had not written a metafile - a guard
+  // that turns a test off is not a test.
+  assert.ok(fs.existsSync(metafilePath), 'the build must write dist/metafile.json');
+  const notices = fs.readFileSync(path.join(root, 'THIRD-PARTY-NOTICES.md'), 'utf8');
+  for (const pkg of packagesFrom(JSON.parse(fs.readFileSync(metafilePath, 'utf8')))) {
+    assert.ok(notices.includes(pkg), `${pkg} is bundled but absent from THIRD-PARTY-NOTICES.md`);
   }
 
   // The old README claimed "18 tests" when there were 22. A number in prose
-  // drifts; a number a test checks does not.
+  // drifts; a number a test checks does not. The phrase itself is required:
+  // wrapped in `if (claimed)`, deleting it from the README made this vacuous.
   const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
   const claimed = readme.match(/(\d+) tests/);
-  if (claimed) {
-    assert.strictEqual(
-      Number(claimed[1]),
-      tests.length,
-      `README claims ${claimed[1]} tests but there are ${tests.length}`
-    );
-  }
-  // Nor may it point at a version that is not this one.
-  const stale = readme.match(/ai-notebook-live-(\d[\w.-]*)\.vsix/);
-  if (stale) {
-    assert.strictEqual(stale[1], manifest.version, 'README install command names a stale version');
+  assert.ok(claimed, 'the README must state how many tests there are');
+  assert.strictEqual(
+    Number(claimed[1]),
+    tests.length,
+    `README claims ${claimed[1]} tests but there are ${tests.length}`
+  );
+  // The install command uses a placeholder, so it cannot go stale; and if a
+  // concrete version ever appears, it has to be this one.
+  assert.match(readme, /ai-notebook-live-<version>\.vsix/, 'the install command must not pin a version');
+  for (const m of readme.matchAll(/ai-notebook-live-(\d[\w.-]*)\.vsix/g)) {
+    assert.strictEqual(m[1], manifest.version, `README names ${m[1]}, not ${manifest.version}`);
   }
 
   // The .vsix used to carry 2,399 files. Keep the win.
