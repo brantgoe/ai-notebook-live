@@ -34,7 +34,9 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - run: npm ci
+      # --omit=optional: keytar, an optional dependency of vsce, downloads and
+      # runs a native prebuild on install. The test legs never invoke vsce.
+      - run: npm ci --omit=optional
       # `npm test` builds first (pretest), so this covers the bundle too.
       - run: npm test
 
@@ -54,7 +56,7 @@ jobs:
       # instead of being silently repaired and left stale in git.
       - name: The committed notices must match what the bundle pulled in
         run: git diff --exit-code -- THIRD-PARTY-NOTICES.md
-      - run: npx @vscode/vsce package --allow-missing-repository
+      - run: npx @vscode/vsce package
       - name: Keep the bundle small
         run: |
           COUNT=$(npx @vscode/vsce ls | wc -l)
@@ -83,7 +85,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      - run: npx @vscode/vsce package --allow-missing-repository
+      - run: npx @vscode/vsce package
       # github.ref_name is "v0.6.0" but vsce names the file
       # "ai-notebook-live-0.6.0.vsix" - no v. Every release so far has told
       # people to install a filename that does not exist.

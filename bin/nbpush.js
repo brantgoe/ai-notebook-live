@@ -182,11 +182,13 @@ function readInfo() {
   try {
     raw = fs.readFileSync(INFO_FILE, 'utf8');
   } catch {
-    process.stderr.write(
-      `nbpush: no bridge found at ${INFO_FILE}\n` +
-        'Run "AI Notebook: Start Local Agent Bridge" from the VS Code command palette.\n'
+    // Thrown, not exited: main() prints and exits for every error alike, and a
+    // --dry-run has to be able to catch this and carry on offline. Calling
+    // process.exit from inside a helper made that impossible.
+    throw new Error(
+      `no bridge found at ${INFO_FILE}\n` +
+        'Run "AI Notebook: Start Local Agent Bridge" from the VS Code command palette.'
     );
-    return process.exit(1);
   }
 
   let info;
@@ -214,11 +216,10 @@ function readInfo() {
 }
 
 function stale(why) {
-  process.stderr.write(
-    `nbpush: the bridge file at ${INFO_FILE} is stale - ${why}.\n` +
-      'Run "AI Notebook: Start Local Agent Bridge" in VS Code to write a fresh one.\n'
+  throw new Error(
+    `the bridge file at ${INFO_FILE} is stale - ${why}.\n` +
+      'Run "AI Notebook: Start Local Agent Bridge" in VS Code to write a fresh one.'
   );
-  return process.exit(1);
 }
 
 function alive(pid) {
@@ -319,12 +320,44 @@ function request(info, { method, pathname, search, body, stream }) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const info = readInfo();
+
+  // A dry run must be possible with no bridge at all - that is half of what
+  // "dry" means. readInfo() and confirmBridge() both ran first, so previewing
+  // offline was impossible. Everything local is decided before anything is
+  // read from disk or the network.
+  const input = chooseInput(args);
+  if (input.kind === 'refuse') {
+    process.stderr.write(`nbpush: ${input.message}\n`);
+    return process.exit(2);
+  }
+  const search = new URLSearchParams();
+  if (args.kind === 'markdown') search.set('kind', 'markdown');
+  if (args.position !== undefined) search.set('position', args.position);
+  if (args.run !== undefined) search.set('run', args.run ? '1' : '0');
+  if (args.notebook) search.set('notebook', args.notebook);
+
+  let info;
+  try {
+    info = readInfo();
+  } catch (err) {
+    if (!args.dryRun) throw err;
+    process.stderr.write(
+      `nbpush: dry run - would ${args.replace !== undefined ? `replace cell ${args.replace}` : `add a ${args.kind} cell`}\n` +
+        `  options: ${search.toString() || '(defaults)'}\n` +
+        `  body:    ${input.kind}\n` +
+        `  target:  unknown (${(err && err.message) || err})\n`
+    );
+    return process.exit(0);
+  }
+
+  // Every path that carries the token goes through the anonymous probe first.
+  // --health and --list used to skip it and send the token to whatever owned
+  // the port - the same exfiltration the main path was fixed for.
+  const health = await confirmBridge(info);
 
   if (args.health) {
-    const res = await request(info, { method: 'GET', pathname: '/health' });
-    process.stdout.write(`${res.text}\n`);
-    return process.exit(res.status === 200 ? 0 : 1);
+    process.stdout.write(`${JSON.stringify(health)}\n`);
+    return process.exit(0);
   }
 
   if (args.list) {
@@ -342,24 +375,9 @@ async function main() {
     return undefined;
   }
 
-  const input = chooseInput(args);
-  if (input.kind === 'refuse') {
-    process.stderr.write(`nbpush: ${input.message}\n`);
-    return process.exit(2);
-  }
-
-  // Before a single byte of the payload goes anywhere.
-  const health = await confirmBridge(info);
-
-  const search = new URLSearchParams();
-  if (args.kind === 'markdown') search.set('kind', 'markdown');
-  if (args.position !== undefined) search.set('position', args.position);
-  if (args.run !== undefined) search.set('run', args.run ? '1' : '0');
-  if (args.notebook) search.set('notebook', args.notebook);
-
   if (args.dryRun) {
     process.stderr.write(
-      `nbpush: would add a ${args.kind} cell to ${health.notebook}\n` +
+      `nbpush: would ${args.replace !== undefined ? `replace cell ${args.replace} in` : `add a ${args.kind} cell to`} ${health.notebook}\n` +
         `  options: ${search.toString() || '(defaults)'}\n` +
         `  body:    ${input.kind}\n`
     );

@@ -17,8 +17,19 @@ const validate = require('./validate');
 const { log } = require('./log');
 
 const MAX_BODY = 1024 * 1024;
+/** Cells per /cells response; the caller pages with ?from=<next>. */
+const MAX_CELLS = 200;
 /** How long to keep draining a rejected upload so its status can be delivered. */
 const DRAIN_MS = 2000;
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** An error that knows its own HTTP status, so callers get told the truth. */
 class BridgeError extends Error {
@@ -133,6 +144,11 @@ class Bridge {
   async stop() {
     if (!this.server) return;
     const server = this.server;
+    // Unlink first, close second. The other order left a moment in which the
+    // file named a port nobody was listening on - on a shared machine another
+    // local user could bind it in that gap and be handed the token by a client
+    // reading the file at the same time.
+    this.unlinkIfOurs();
     await new Promise((resolve) => {
       server.close(resolve);
       // server.close() waits for every open connection, and a client that was
@@ -144,6 +160,10 @@ class Bridge {
     this.server = undefined;
     this.port = undefined;
     this.token = undefined;
+    log('bridge stopped');
+  }
+
+  unlinkIfOurs() {
     try {
       // Only remove the advertisement if it is still ours: another window may
       // have claimed this path since, and deleting theirs would leave their
@@ -153,7 +173,6 @@ class Bridge {
     } catch {
       /* already gone, or not parseable - either way not ours to tidy */
     }
-    log('bridge stopped');
   }
 
   /**
@@ -206,9 +225,24 @@ class Bridge {
         return;
       } catch (err) {
         if (err.code !== 'EEXIST' || attempt === 1) throw err;
-        // Something is already here. We know it is not a live bridge on this
-        // port, because listen() would have failed first - so it is stale, or
-        // it is a plant. Either way it does not get to keep the path.
+        // Something is already here. On a FIXED port it cannot be a live
+        // bridge, because listen() would have failed first. That reasoning
+        // does not hold for bridge.port 0: this window got a fresh port, the
+        // other window is alive on its own, and unlinking its file left it
+        // listening but unreachable - the exact failure the module comment
+        // says was fixed once already. So look before unlinking.
+        let seen;
+        try {
+          seen = JSON.parse(fs.readFileSync(file, 'utf8'));
+        } catch {
+          seen = undefined; // unparseable: stale, or a plant
+        }
+        if (seen && Number.isInteger(seen.pid) && seen.pid !== process.pid && alive(seen.pid)) {
+          throw new Error(
+            `another VS Code window (pid ${seen.pid}) already advertises a bridge at ${file}. ` +
+              'Stop its bridge first, or this one would be unreachable.'
+          );
+        }
         fs.unlinkSync(file);
       }
     }
@@ -261,7 +295,8 @@ class Bridge {
 
   async handle(req, res) {
     const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
-    if (req.method === 'GET' && url.pathname === '/health' && this.authorized(req)) {
+    const reading = req.method === 'GET' || req.method === 'HEAD';
+    if (reading && url.pathname === '/health' && this.authorized(req)) {
       const notebook = this.resolveNotebook();
       return send(res, 200, {
         ok: true,
@@ -279,7 +314,7 @@ class Bridge {
     // Reading is routed before the POST-only gate. An agent that can add a cell
     // but never look at one cannot check its own work, or see what the user
     // changed afterwards.
-    if (req.method === 'GET' && url.pathname === '/cells') {
+    if (reading && url.pathname === '/cells') {
       return send(res, 200, this.readCells(url.searchParams));
     }
 
@@ -295,6 +330,7 @@ class Bridge {
     }
 
     if (url.pathname === '/cell') {
+      requireJson(req);
       const body = await readJson(req);
       // The body supplies content and nothing else. It used to be spread into
       // the options bag, so any key a caller invented became an option - and
@@ -307,19 +343,24 @@ class Bridge {
       // Checked before the cell is created, so a rejected push leaves nothing.
       const code = validate.cellText(raw);
       const writer = await this.openWriter({ search: url.searchParams });
+      let result;
       try {
         writer.write(code);
-        return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+        result = await this.closeWriter(writer, { search: url.searchParams });
       } catch (err) {
         await writer.abandon();
         throw err;
       }
+      // Outside the try: a client that hung up before the answer arrived has
+      // still had its cell written, and undoing that would be wrong twice.
+      return send(res, 200, result);
     }
 
     if (url.pathname === '/cell/replace') {
       // Rewriting an existing cell, as opposed to adding one. Deliberately
       // separate from /cell: appending is additive and forgiving, replacing
       // destroys what was there, so it must be asked for by name and by index.
+      requireJson(req);
       const body = await readJson(req);
       const raw = typeof body.code === 'string' ? body.code : body.text;
       if (typeof raw !== 'string') {
@@ -360,6 +401,7 @@ class Bridge {
       }
 
       const writer = await CellWriter.replace(notebook, cell);
+      let result;
       try {
         writer.write(code);
         // The guard that has always protected /cell, on the one path where the
@@ -377,17 +419,18 @@ class Bridge {
           'info',
           `An agent rewrote cell ${at} of ${path.basename(notebook.uri.fsPath)}. Ctrl+Z undoes it.`
         );
-        return send(res, 200, {
+        result = {
           ok: true,
           notebook: notebook.uri.fsPath,
           index: at,
           characters: text.length,
           replaced: previous,
-        });
+        };
       } catch (err) {
         await writer.abandon();
         throw err;
       }
+      return send(res, 200, result);
     }
 
     if (url.pathname === '/cell/stream') {
@@ -406,7 +449,7 @@ class Bridge {
         // the request, and a destroyed request means Node resets the socket
         // before send() can drain it and deliver the status.
         for await (const chunk of req.iterator({ destroyOnReturn: false })) {
-          size += chunk.length;
+          size += Buffer.byteLength(chunk); // bytes, as the README says - not UTF-16 units
           if (size > MAX_BODY) throw new BridgeError('body too large', 413);
           // Per chunk, before anything is written. Node's utf8 decoder joins
           // multi-byte sequences split across chunks, so a surrogate pair is
@@ -458,7 +501,15 @@ class Bridge {
     }
     const all = notebook.getCells();
     const from = clampIndex(search.get('from'), 0, all.length);
-    const to = clampIndex(search.get('to'), all.length, all.length);
+    let to = clampIndex(search.get('to'), all.length, all.length);
+    // Per-cell clipping bounded the size of each cell and nothing bounded the
+    // number of them, so a large notebook forced a multi-megabyte response from
+    // one authenticated GET. Page instead: the caller is told where to resume.
+    let more = false;
+    if (to - from > MAX_CELLS) {
+      to = from + MAX_CELLS;
+      more = true;
+    }
     const wantOutputs = search.get('outputs') === '1';
     // A notebook can be far larger than anything worth sending in one response,
     // so each cell is clipped and the caller is told when that happened.
@@ -501,6 +552,7 @@ class Bridge {
       from,
       cells,
       truncated,
+      ...(more ? { more: true, next: to } : {}),
     };
   }
 
@@ -637,14 +689,29 @@ function send(res, status, body) {
   req.once('close', done);
 }
 
+/**
+ * A JSON endpoint should say so when handed something else. A missing header is
+ * forgiven - curl users rarely set one - but text/plain or a form encoding was
+ * being JSON-parsed regardless, which is the kind of guess this file exists not
+ * to make.
+ */
+function requireJson(req) {
+  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (type && type !== 'application/json') {
+    throw new BridgeError(`send application/json, not ${type}`, 415);
+  }
+}
+
 async function readJson(req) {
   let body = '';
   req.setEncoding('utf8');
   // Same reason as /cell/stream: throwing out of this loop must not destroy the
   // request, or the 413 never reaches the caller.
+  let bytes = 0;
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     body += chunk;
-    if (body.length > MAX_BODY) throw new BridgeError('body too large', 413);
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > MAX_BODY) throw new BridgeError('body too large', 413);
   }
   if (!body.trim()) return {};
   let parsed;

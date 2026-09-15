@@ -27,9 +27,13 @@ let insertLock = Promise.resolve();
  * first where final takes the last, so final's answer can only be longer.
  * The fuzzer in test/run.js checks both directions.
  *
- * Deliberately NOT normalised in final mode: a trailing \r from CRLF input
- * stays, because removing a byte streaming already emitted would be a
- * retraction. Do not "clean that up".
+ * Deliberately NOT normalised here: a trailing \r from CRLF input stays,
+ * because the PARSER removing a byte streaming already emitted would be a
+ * retraction, and the parser is called on every prefix. end() does trim
+ * trailing whitespace - including that \r - but only once, in the final
+ * write, which is one visible change of an invisible character rather than a
+ * stream that flickers. The place to normalise, if it is ever wanted, is
+ * write(), before anything has been emitted at all.
  *
  * Policy where the two readings genuinely cannot be told apart - two separate
  * fenced blocks look exactly like one block containing a fence: FAIL LOUD,
@@ -179,6 +183,9 @@ class CellWriter {
     // The text abandon() put back, on the paths where it succeeded. Undefined
     // means there is nothing for keepPartial() to safely undo.
     this.restoredTo = undefined;
+    // Set by end() once the final write has landed. From then on the content is
+    // the user's, and abandon() will not take it back.
+    this.committed = false;
   }
 
   /** True once the model has produced text worth keeping. */
@@ -339,6 +346,20 @@ class CellWriter {
       target.slice(keep)
     );
     await apply(edit, 'write into the cell');
+    // The document may not hold `target` even though the edit applied. The
+    // range above was computed from `current`, but VS Code resolves line and
+    // character positions against the document AS IT IS WHEN THE EDIT LANDS -
+    // so a keystroke inside this await does not merely get lost, it shifts the
+    // coordinates and the two texts are spliced together. Measured:
+    // "AI VERSIONID-APPLY". The comment on owns() said "it stops; it never
+    // reverts", and with `foreign` left false it did neither: it mangled and
+    // nothing downstream noticed. Verify, and treat a mismatch as the foreign
+    // edit it is, so the next write stops and the user is told.
+    const landed = doc.getText();
+    if (landed !== target) {
+      this.foreign = true;
+      return false;
+    }
     // Recorded only after the edit lands, so our own writes never look foreign.
     this.written = target;
     return true;
@@ -393,6 +414,11 @@ class CellWriter {
     if (this.failed) throw this.failed;
     const cell = this.cell();
     if (!cell) throw new Error('The cell being written was removed from the notebook.');
+    // From here the write is the user's, not ours. abandon() used to undo it
+    // anyway if anything threw AFTER this point - the bridge's send() on a
+    // socket the client had already closed was enough to roll back a replace
+    // that had succeeded, or delete a cell that had been correctly inserted.
+    this.committed = true;
     return cell.document.getText();
   }
 
@@ -409,6 +435,13 @@ class CellWriter {
   async abandon() {
     // Idempotent: the bridge can reach this twice through nested catches.
     if (this.released) return { restored: false, partial: this.text({ final: true }) };
+    // A committed write is not ours to take back. Whatever failed afterwards
+    // failed AFTER the notebook was correctly changed, and reverting it makes
+    // the situation worse, not better.
+    if (this.committed) {
+      this.released = true;
+      return { restored: false, partial: this.text({ final: true }), committed: true };
+    }
     this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
@@ -417,7 +450,14 @@ class CellWriter {
     await this.flushing.catch(() => {});
     const partial = this.text({ final: true });
     const cell = this.cell();
-    if (!cell) return { restored: false, partial };
+    if (!cell) {
+      // The cell is gone, so there is nothing to restore - but this writer is
+      // finished with. It used to return here WITHOUT releasing, so `released`
+      // was not a sink: a later end() threw a different error than the one
+      // meant for an abandoned writer, and abandon() itself was re-entrant.
+      this.released = true;
+      return { restored: false, partial };
+    }
 
     if (this.origin === 'insert') {
       const edit = new vscode.WorkspaceEdit();
@@ -540,7 +580,43 @@ const OUTPUT_MIMES = [
   'application/vnd.code.notebook.stdout',
   'application/vnd.code.notebook.stderr',
   'text/plain',
+  // A cell whose only output was one of these contributed nothing to the Fix
+  // or Explain prompt, and read as empty over /cells.
+  'text/markdown',
+  'application/json',
 ];
+
+/**
+ * Terminal escapes out of an output, not merely refused on the way in.
+ *
+ * IPython colours its tracebacks, so a notebook acquires raw ESC sequences
+ * legitimately. cellText refuses them inbound; outbound they flowed untouched
+ * through /cells into whatever rendered the MCP result - which may be a
+ * terminal. Source is left verbatim (it is what expect= must match); outputs
+ * are display-only and the escapes are not content.
+ */
+function stripEscapes(s) {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0b\x0e-\x1f\x7f]/g, '');
+}
+
+/** Just the text of an HTML repr - a dataframe table, mostly - without the markup. */
+function htmlToText(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<\/(tr|p|div|h[1-6]|li)>/gi, '\n')
+    .replace(/<\/(td|th)>/gi, '\t')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
 
 /** Human-readable outputs for a cell: errors first, then stdout/stderr/text. */
 function readOutputs(cell, { limit = 1200 } = {}) {
@@ -560,12 +636,14 @@ function readOutputs(cell, { limit = 1200 } = {}) {
         try {
           const err = JSON.parse(body);
           const stack = (err.stack || '').split('\n').slice(0, 12).join('\n');
-          errors.push([`${err.name || 'Error'}: ${err.message || ''}`, stack].join('\n').trim());
+          errors.push(stripEscapes([`${err.name || 'Error'}: ${err.message || ''}`, stack].join('\n').trim()));
         } catch {
-          errors.push(body);
+          errors.push(stripEscapes(body));
         }
       } else if (OUTPUT_MIMES.includes(item.mime)) {
-        text.push(body);
+        text.push(stripEscapes(body));
+      } else if (item.mime === 'text/html') {
+        text.push(htmlToText(body));
       } else if (item.mime.startsWith('image/')) {
         text.push(`<${item.mime} output>`);
       }

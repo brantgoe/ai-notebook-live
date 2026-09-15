@@ -141,9 +141,16 @@ function activate(context) {
           'Other local programs can now read and write this notebook. Stop it from the control panel.'
       );
     }
-    await vscode.env.clipboard.writeText(state.bridge.curlExample());
+    // nbpush, not curl. The curl form read the token out of the file and sent
+    // it to whatever happened to own the port - the exfiltration the main
+    // nbpush path was fixed for. nbpush probes anonymously first.
+    const nbpush = state.context.asAbsolutePath(path.join('bin', 'nbpush.js'));
+    await vscode.env.clipboard.writeText(
+      `printf 'print("hello from an agent")' | node ${JSON.stringify(nbpush)}`
+    );
     vscode.window.showInformationMessage(
-      `Copied a ready-to-run bridge command (port ${state.bridge.port}).`
+      `Copied a ready-to-run bridge command (port ${state.bridge.port}). It checks it is talking to ` +
+        'this bridge before sending anything.'
     );
   });
   register('aiNotebookLive.copyAgentSetup', copyAgentSetup);
@@ -179,8 +186,12 @@ async function deactivate() {
     state.active = undefined;
   }
   forgetSessionGrants();
-  if (state.bridge) await state.bridge.stop();
-  disposeLog();
+  try {
+    if (state.bridge) await state.bridge.stop();
+  } finally {
+    // Always, or a rejection above leaks the output channel.
+    disposeLog();
+  }
 }
 
 /* ------------------------------- UI plumbing ------------------------------ */
@@ -344,6 +355,17 @@ async function update(key, value) {
  */
 async function copyAgentSetup() {
   const server = state.context.asAbsolutePath(path.join('bin', 'mcp-server.js'));
+  if (vscode.env.remoteName) {
+    // The extension runs on the remote (extensionKind: workspace), so this path
+    // exists there and the bridge listens on the REMOTE loopback - while the
+    // clipboard is local. A locally-run Codex could not reach it even with the
+    // right path.
+    vscode.window.showWarningMessage(
+      `AI Notebook Live: you are connected to a remote (${vscode.env.remoteName}). The MCP server and ` +
+        'the bridge both live there, so the other AI tool has to run on the remote too - ' +
+        'in a terminal inside this VS Code window, for example. The command below is for that shell.'
+    );
+  }
   const line = `codex mcp add ai-notebook -- node ${JSON.stringify(server)}`;
   const pick = await vscode.window.showInformationMessage(
     'Let another AI tool — Codex, for example — read and write this notebook while you have it ' +
@@ -851,7 +873,11 @@ async function pump({ writer, system, user, opts, token, target, intent, request
     if (!writer.produced()) {
       await writer.abandon();
       if (result.cancelled) {
-        vscode.window.setStatusBarMessage('$(stop-circle) AI generation cancelled', 2500);
+        // Through reportStop, which knows whether this was the user's Cancel or
+        // the inactivity timer. The early return here used to say "cancelled"
+        // for both, so a generation that produced nothing for five minutes was
+        // reported as something the user did.
+        reportStop(gaveUp, silence);
         return;
       }
     }
@@ -921,6 +947,13 @@ async function pump({ writer, system, user, opts, token, target, intent, request
         (result.refusalDetails && result.refusalDetails.explanation) ||
         'the model declined this request.';
       vscode.window.showWarningMessage(`AI Notebook Live: ${detail}`);
+      return;
+    }
+    if (result.stopReason === 'max_turns') {
+      vscode.window.showWarningMessage(
+        'AI Notebook Live: the Claude Code CLI stopped before it was finished, so the cell may be cut off. ' +
+          'Ask again with a narrower instruction, or revise the cell to complete it.'
+      );
       return;
     }
     if (result.stopReason === 'max_tokens') {

@@ -3,7 +3,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-const Anthropic = require('@anthropic-ai/sdk');
 const { log } = require('./log');
 
 const SECRET_KEY = 'aiNotebookLive.anthropicApiKey';
@@ -177,6 +176,11 @@ async function stream({ target, system, user, opts, token, onText }) {
 }
 
 async function streamApi({ system, user, opts, token, onText, apiKey }) {
+  // Required here, not at the top: the SDK is the bulk of the bundle, and a
+  // CLI-only user was paying its module initialisation on every notebook open
+  // for a code path they never take. esbuild still bundles it; this only
+  // defers evaluating it until the first API call.
+  const Anthropic = require('@anthropic-ai/sdk');
   const client = new Anthropic({ apiKey, maxRetries: 2 });
   const params = {
     model: opts.model,
@@ -442,6 +446,15 @@ function streamCli({ system, user, opts, token, onText, binary }) {
         return reject(
           new ProviderError(`The \`claude\` CLI produced no output. ${said.split('\n').slice(-2).join(' ')}`.trim())
         );
+      }
+      // Trouble reported in-band AFTER some text arrived - half a function and
+      // then error_max_turns - used to resolve as a clean end_turn with no
+      // warning at all. The API path's max_tokens toast could never fire for the
+      // CLI because the stop reason was hard-coded. Surface it as the CLI's
+      // equivalent so pump can say the cell may be cut off.
+      if (/error_max_turns|max_turns/.test(said)) {
+        log('claude CLI stopped early:', said);
+        return resolve({ provider: 'claude-cli', model, stopReason: 'max_turns' });
       }
       return resolve({ provider: 'claude-cli', model, stopReason: 'end_turn' });
     };
