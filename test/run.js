@@ -2816,6 +2816,84 @@ test('the bridge refuses malformed input instead of guessing', async () => {
   }
 });
 
+test('an ambiguous notebook= is refused, never resolved to whichever came first', async () => {
+  // targetNotebook picked with `find`, so a hint matching several open notebooks
+  // returned whichever VS Code listed first - and answered 200, so the caller
+  // had no way to know it had written to the wrong file. The match is a
+  // substring of the whole path, which makes `notebook=/` match every notebook
+  // open. Matching none was already refused; matching several is the same
+  // mistake, and was the quiet one.
+  const extension = require(path.join('..', 'extension.js'));
+  const { targetNotebook } = extension.__test;
+  const mk = (fsPath) =>
+    new vscode.NotebookDocument(
+      fsPath,
+      [{ kind: vscode.NotebookCellKind.Code, value: 'x = 1', languageId: 'python' }],
+      { metadata: { kernelspec: { language: 'python' } } }
+    );
+
+  const scratch = mk('/w/proj/scratch_analysis.ipynb');
+  const report = mk('/w/proj/production_report.ipynb');
+  vscode.__test.notebooks.length = 0;
+  vscode.__test.notebooks.push(scratch, report);
+  vscode.window.visibleNotebookEditors.length = 0;
+  vscode.window.activeNotebookEditor = undefined;
+
+  try {
+    // Unambiguous hints still resolve, and a hint matching nothing still returns
+    // undefined for the bridge to turn into its own 409.
+    assert.strictEqual(targetNotebook('scratch'), scratch);
+    assert.strictEqual(targetNotebook('production_report'), report);
+    assert.strictEqual(targetNotebook('no-such-file'), undefined);
+
+    // Every one of these matches both notebooks.
+    for (const hint of ['/', '.ipynb', '/w/proj', 'proj']) {
+      assert.throws(
+        () => targetNotebook(hint),
+        (err) => {
+          assert.strictEqual(err.status, 409, `${hint} must be a 409`);
+          assert.match(err.message, /scratch_analysis\.ipynb/, 'names the candidates');
+          assert.match(err.message, /production_report\.ipynb/, 'names all of them');
+          return true;
+        },
+        `notebook=${hint} must refuse rather than choose`
+      );
+    }
+
+    // And the refusal has to reach the client, not die inside the handler.
+    const bridge = new Bridge({
+      resolveNotebook: targetNotebook,
+      decideRun: async () => ({ run: false, reason: 'test policy' }),
+      infoDir: BRIDGE_HOME,
+      listNotebooks: () => ['scratch_analysis.ipynb', 'production_report.ipynb'],
+    });
+    const { port, token } = await bridge.start(0);
+    try {
+      const body = JSON.stringify({ code: 'must_not_land = 1' });
+      const res = await call(port, token, { path: '/cell?notebook=%2Fw%2Fproj', body });
+      assert.strictEqual(res.status, 409, 'an ambiguous push is refused');
+      assert.match(res.body, /matches 2 open notebooks/);
+      assert.strictEqual(scratch.cellCount, 1, 'nothing written to the first match');
+      assert.strictEqual(report.cellCount, 1, 'nor to the other one');
+
+      // Reading is refused for the same reason: /cells must not answer with a
+      // notebook the caller did not unambiguously ask for.
+      const read = await call(port, token, { method: 'GET', path: '/cells?notebook=.ipynb' });
+      assert.strictEqual(read.status, 409, 'an ambiguous read is refused too');
+
+      // Narrowing it fixes it, which is what the message tells you to do.
+      const ok = await call(port, token, { path: '/cell?notebook=production_report', body });
+      assert.strictEqual(ok.status, 200);
+      assert.strictEqual(report.cellCount, 2, 'the named notebook got it');
+      assert.strictEqual(scratch.cellCount, 1, 'and only that one');
+    } finally {
+      await bridge.stop();
+    }
+  } finally {
+    vscode.window.activeNotebookEditor = undefined;
+  }
+});
+
 test('a body key cannot smuggle itself in as an option', async () => {
   // The body used to be spread into the options bag, so any key a caller
   // invented became an option - and body keys beat the query string.

@@ -7,6 +7,20 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [Unreleased]
+
+### Fixed — talking to other tools
+
+- **An ambiguous `notebook=` wrote to whichever notebook VS Code listed first,
+  and answered `200`.** The hint is matched as a substring of the whole path, so
+  `notebook=/` — or a folder fragment, or `.ipynb` — matched every open
+  notebook, and the caller got no signal that it had landed somewhere it did not
+  mean. A hint matching *nothing* was already refused for exactly this reason;
+  matching *several* is the same mistake and was the quiet one. It is now a
+  `409` naming the candidates, so an agent can narrow the fragment instead of
+  guessing. Found by adversarial probing of the running bridge, not by reading
+  the code.
+
 ## [0.6.1] - 2026-09-15
 
 The fourteen findings from the 0.5.0 review that 0.6.0 left open. I had said
@@ -458,6 +472,7 @@ behind your back: destroy your code, or run code you did not agree to run.
 Initial version: stream Claude-generated code into notebook cells, revise,
 explain and fix cells, and a localhost bridge for external agents.
 
+[Unreleased]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.1...HEAD
 [0.6.1]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.4.0...v0.5.0

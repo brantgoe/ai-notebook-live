@@ -13,7 +13,7 @@ the open notebook and write cells into it. That is off by default.
 
 > **What that means in practice.** Settings and the bridge API can still change
 > between versions, so read the [changelog](CHANGELOG.md) before you upgrade. It
-> is used daily by its author and has 125 tests behind it, but few other people
+> is used daily by its author and has 126 tests behind it, but few other people
 > have run it yet, so expect rough edges. Bug reports are welcome in
 > [Issues](https://github.com/brantgoe/ai-notebook-live/issues); security
 > problems go the private route in [SECURITY.md](SECURITY.md).
@@ -187,8 +187,9 @@ body that is not a JSON object, a body that produces no content — including fo
 `/cell/replace`, which will not blank a cell for you — an unrecognised `kind`,
 or a `position` that is not a whole number. `404` for an unknown path, `405` for
 the wrong method. `409` when no notebook is open, when `notebook=` matches none
-of the open ones — it will not quietly write somewhere else — or when `expect=`
-does not match. `413` for a body over 1 MiB.
+of the open ones **or more than one** — it will not quietly write somewhere
+else, and an ambiguous hint names the candidates so you can narrow it — or when
+`expect=` does not match. `413` for a body over 1 MiB.
 
 ## Letting other AI tools write here
 
@@ -301,7 +302,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 125 tests, no VS Code needed
+npm test          # 126 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

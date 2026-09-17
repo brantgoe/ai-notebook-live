@@ -14,7 +14,7 @@ const {
   invalidateSecretCache,
   invalidateCliCache,
 } = require('./src/provider');
-const { Bridge } = require('./src/bridge');
+const { Bridge, BridgeError } = require('./src/bridge');
 const {
   decideExecution,
   forgetSessionGrants,
@@ -591,7 +591,22 @@ function targetNotebook(hint) {
     // A hint that matches nothing returns undefined rather than falling through
     // to the active notebook: silently writing into a different file than the
     // caller asked for is worse than refusing.
-    return open.find((d) => d.uri.fsPath.includes(String(hint)));
+    const matches = open.filter((d) => d.uri.fsPath.includes(String(hint)));
+    // A hint that matches SEVERAL is the same mistake wearing a different hat,
+    // and it used to be the quiet one: `find` handed back whichever notebook VS
+    // Code happened to list first, with a 200. The match is a substring of the
+    // whole path, so `notebook=/` matched every open notebook and the caller
+    // could not tell which one it had written to. Name the candidates instead -
+    // the agent can narrow the fragment, which it cannot do from a 200.
+    if (matches.length > 1) {
+      throw new BridgeError(
+        `${JSON.stringify(hint)} matches ${matches.length} open notebooks: ` +
+          `${matches.map((d) => path.basename(d.uri.fsPath)).join(', ')}. ` +
+          'Use a longer fragment that picks out one.',
+        409
+      );
+    }
+    return matches[0];
   }
   const active = vscode.window.activeNotebookEditor;
   if (active) return active.notebook;
@@ -987,5 +1002,6 @@ module.exports = {
     setActive: (cts) => {
       state.active = cts;
     },
+    targetNotebook,
   },
 };
