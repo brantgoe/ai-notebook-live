@@ -9,6 +9,14 @@ open. Not in a side panel you copy out of, and not on disk behind a stale tab.
 There is also a localhost bridge, so other AI tools on your machine can read
 the open notebook and write cells into it. That is off by default.
 
+> **Status: early, and under active development.** Pre-1.0 — settings and the
+> bridge API can still change between versions, so read the
+> [changelog](CHANGELOG.md) before you upgrade. It is used daily by its author
+> and has 125 tests behind it, but few other people have run it yet, so expect
+> rough edges. Bug reports are welcome in
+> [Issues](https://github.com/brantgoe/ai-notebook-live/issues); security
+> problems go the private route in [SECURITY.md](SECURITY.md).
+
 > Not affiliated with, endorsed by, or sponsored by Anthropic.
 > Claude is a trademark of Anthropic, PBC.
 
