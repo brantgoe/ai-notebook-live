@@ -341,7 +341,7 @@ class Bridge {
         return send(res, 400, { error: 'body needs a "code" string' });
       }
       // Checked before the cell is created, so a rejected push leaves nothing.
-      const code = validate.cellText(raw);
+      const { text: code, repaired } = validate.cellText(raw);
       const writer = await this.openWriter({ search: url.searchParams });
       let result;
       try {
@@ -353,7 +353,11 @@ class Bridge {
       }
       // Outside the try: a client that hung up before the answer arrived has
       // still had its cell written, and undoing that would be wrong twice.
-      return send(res, 200, result);
+      if (repaired) {
+        log(`repaired ${repaired} invisible character(s) in the pushed cell`);
+        result.repaired = repaired;
+      }
+      return send(res, result.foreign ? 409 : 200, result);
     }
 
     if (url.pathname === '/cell/replace') {
@@ -366,10 +370,19 @@ class Bridge {
       if (typeof raw !== 'string') {
         return send(res, 400, { error: 'body needs a "code" string' });
       }
-      const code = validate.cellText(raw);
+      const { text: code, repaired } = validate.cellText(raw);
       const notebook = this.resolveNotebook(url.searchParams.get('notebook'));
       if (!notebook) throw new BridgeError('no notebook is open in VS Code', 409);
-      const at = Number(url.searchParams.get('index'));
+      // Read the raw parameter before coercing. Number() maps null, '', ' ',
+      // '-0', '0x0' and '0.0' all to a valid-looking 0, so a caller that forgot
+      // the one parameter naming what it destroys silently lost cell 0 - the
+      // imports, usually. Omitting the index is a different mistake from giving
+      // a bad one, and it gets its own message.
+      const rawIndex = url.searchParams.get('index');
+      if (rawIndex === null || rawIndex.trim() === '') {
+        throw new BridgeError('index= is required: say which cell to replace', 400);
+      }
+      const at = /^\d+$/.test(rawIndex.trim()) ? Number(rawIndex.trim()) : NaN;
       if (!Number.isInteger(at) || at < 0 || at >= notebook.cellCount) {
         throw new BridgeError(
           `index must be a cell that exists: 0..${notebook.cellCount - 1}`,
@@ -426,6 +439,10 @@ class Bridge {
           characters: text.length,
           replaced: previous,
         };
+        if (repaired) {
+          log(`repaired ${repaired} invisible character(s) in the replacement`);
+          result.repaired = repaired;
+        }
       } catch (err) {
         await writer.abandon();
         throw err;
@@ -438,6 +455,7 @@ class Bridge {
       // generator shows up in the notebook as it produces text.
       req.setEncoding('utf8');
       let size = 0;
+      let streamRepaired = 0;
       // Deliberately not opened until the first byte arrives. Opening on the
       // headers meant a client that connected and then stalled - nbpush on a
       // terminal, waiting for stdin that never came - left an empty cell
@@ -454,9 +472,16 @@ class Bridge {
           // Per chunk, before anything is written. Node's utf8 decoder joins
           // multi-byte sequences split across chunks, so a surrogate pair is
           // never torn apart here - an unpaired one really was sent as one.
-          validate.cellText(chunk);
+          const checked = validate.cellText(chunk);
+          if (checked.repaired) {
+            streamRepaired += checked.repaired;
+            log(`repaired ${checked.repaired} invisible character(s) in a streamed chunk`);
+          }
           if (!writer) writer = await this.openWriter({ search: url.searchParams });
-          writer.write(chunk);
+          // The repaired text, not the raw chunk: this path validated and then
+          // wrote the original anyway, so NBSP survived on the one endpoint the
+          // README's own `claude -p ... | nbpush` example uses.
+          writer.write(checked.text);
         }
       } catch (err) {
         // The push failed, so take the half-written cell back out. Note the
@@ -471,7 +496,9 @@ class Bridge {
         return send(res, 400, { error: 'nothing to insert: the request body was empty' });
       }
       try {
-        return send(res, 200, await this.closeWriter(writer, { search: url.searchParams }));
+        const done = await this.closeWriter(writer, { search: url.searchParams });
+        if (streamRepaired) done.repaired = streamRepaired;
+        return send(res, done.foreign ? 409 : 200, done);
       } catch (err) {
         // /cell wraps this and /cell/stream did not, so a failure in the final
         // write left the half-written cell sitting in the notebook.
@@ -600,6 +627,31 @@ class Bridge {
     // empty one behind. pump() has always done this; the bridge did not.
     await requireProduced(writer, 'insert');
     const text = await writer.end();
+    if (writer.foreign) {
+      // The user typed into the cell while the push was landing, so the writer
+      // stopped and kept THEIR version. extension.js has always refused to run
+      // in this case and said so; the bridge asked the execution policy anyway
+      // and answered ok:true - so an agent was told its code was in the cell
+      // when the cell holds something else, and with bridge.execution 'always'
+      // that other thing ran. Answered as a 409 by the handlers: a conflict,
+      // which is exactly what it is.
+      log(`push superseded: cell ${writer.index} was edited while it was being written`);
+      this.notify(
+        'warning',
+        'AI Notebook Live: you edited that cell while a program was writing to it, so the ' +
+          'write stopped and your version was kept. Nothing was run.'
+      );
+      return {
+        ok: false,
+        foreign: true,
+        wrote: false,
+        notebook: writer.notebook.uri.fsPath,
+        index: writer.index,
+        characters: 0,
+        ran: false,
+        reason: 'you edited the cell while it was being written, so your version was kept',
+      };
+    }
     const decision = await this.decideRun({
       requested,
       preview: text,

@@ -2,6 +2,7 @@
 const vscode = require('vscode');
 const { log } = require('./log');
 const validate = require('./validate');
+const { clipText } = require('./notebook');
 
 /**
  * The single gate on executing a notebook cell.
@@ -117,8 +118,26 @@ async function decideExecution({
   return askNow(intent, code);
 }
 
+const PREVIEW_LIMIT = 900;
+
 function promptFor(intent, preview) {
-  const detail = preview.length > 900 ? `${preview.slice(0, 900)}\n...` : preview;
+  // What you approve is the WHOLE cell; what you were shown was the first 900
+  // characters and a bare "...", which reads as the end of the code rather than
+  // as a warning that 1,900 characters are hidden below it. The tail is exactly
+  // where anything nasty would sit. Say the real number, and cut on a line
+  // boundary so the last visible line is a whole line. clipText is the shared
+  // clipper, so a surrogate pair cannot be halved here either.
+  const clipped = preview.length > PREVIEW_LIMIT;
+  let detail = preview;
+  if (clipped) {
+    const head = clipText(preview, PREVIEW_LIMIT);
+    const lastBreak = head.lastIndexOf('\n');
+    const shown = lastBreak > PREVIEW_LIMIT / 2 ? head.slice(0, lastBreak) : head;
+    detail =
+      `Showing the first ${shown.length} of ${preview.length} characters. ` +
+      `Read the whole cell before approving.\n\n${shown}\n\n` +
+      `[${preview.length - shown.length} more characters not shown]`;
+  }
   const buttons = ['Run it'];
   // No blanket grant for code another program pushed in. The grant is keyed on
   // intent alone, so one click on one agent's harmless-looking cell approved
@@ -126,7 +145,9 @@ function promptFor(intent, preview) {
   // measured: three pushes, one dialog shown, all three executed. Your own
   // generations keep the convenience, because you asked for each of them by
   // name; nothing asks you before an agent pushes.
-  if (intent !== 'bridge') buttons.push('Always run these this session');
+  // Never offer a blanket grant off a preview the user could not fully read:
+  // "always" would be answered on the strength of a partial cell.
+  if (intent !== 'bridge' && !clipped) buttons.push('Always run these this session');
   // Modal on purpose: a consent prompt that can be missed is not consent.
   return vscode.window.showWarningMessage(
     `Run this ${LABEL[intent] || 'generated'} code in your notebook?`,

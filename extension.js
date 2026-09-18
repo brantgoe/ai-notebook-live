@@ -1,5 +1,6 @@
 'use strict';
 const path = require('path');
+const os = require('os');
 const vscode = require('vscode');
 const { settings } = require('./src/config');
 const { log, show: showLog, dispose: disposeLog } = require('./src/log');
@@ -714,6 +715,13 @@ async function explain(arg, { token, opts, provider, intent, cancel }) {
 
 /** The directory the `claude` CLI should run in: the notebook's own project. */
 function workingDirFor(notebook) {
+  // The CLI is Claude Code, and Claude Code obeys the folder it is started in:
+  // that folder's .claude/settings.json hooks RUN, and its CLAUDE.md steers the
+  // prompt. Handing it an untrusted workspace therefore executes code from a
+  // repository the user explicitly declined to trust - `claude --print` cannot
+  // stop to ask, so it just happens. Execution and the bridge were already
+  // gated on isTrusted; this was the third door and it was open.
+  if (vscode.workspace.isTrusted === false) return os.tmpdir();
   const folder = vscode.workspace.getWorkspaceFolder(notebook.uri);
   if (folder) return folder.uri.fsPath;
   return notebook.uri.scheme === 'file' ? path.dirname(notebook.uri.fsPath) : undefined;
@@ -1003,5 +1011,6 @@ module.exports = {
       state.active = cts;
     },
     targetNotebook,
+    workingDirFor,
   },
 };

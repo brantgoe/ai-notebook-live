@@ -13,7 +13,7 @@ the open notebook and write cells into it. That is off by default.
 
 > **What that means in practice.** Settings and the bridge API can still change
 > between versions, so read the [changelog](CHANGELOG.md) before you upgrade. It
-> is used daily by its author and has 126 tests behind it, but few other people
+> is used daily by its author and has 131 tests behind it, but few other people
 > have run it yet, so expect rough edges. Bug reports are welcome in
 > [Issues](https://github.com/brantgoe/ai-notebook-live/issues); security
 > problems go the private route in [SECURITY.md](SECURITY.md).
@@ -136,7 +136,7 @@ from it; turn that on yourself if you want it.
 | `effort` | `medium` | Reasoning effort. API provider only |
 | `maxTokens` | `8000` | Per cell. API provider only |
 | `contextCells` | `12` | Preceding cells sent as context; `-1` for all |
-| `includeOutputs` | `true` | Send cell outputs and tracebacks too — see [Privacy](#privacy) |
+| `includeOutputs` | `true` | Send cell outputs and tracebacks too — see [Privacy](#privacy). *Fix the Error* always sends the traceback |
 | `execution` | `ask` | Whether generated code runs |
 | `systemPromptExtra` | — | House style, e.g. *"Beginner class: keep code simple and comment every line"* |
 | `refusalFallback` | `true` | Retry a declined request on a fallback model |
@@ -177,6 +177,11 @@ Query parameters — and only the query string: `kind=code|markdown`,
 `from=`, `to=`, `outputs=1`. On `/cell/replace`: `index=` and `expect=`. The
 body carries the content and nothing else.
 
+Code that reaches the bridge is checked for characters the kernel could not run
+— a non-breaking space where a space belongs, a zero-width joiner inside an
+identifier. They are rewritten rather than refused, and the response carries
+`repaired: <n>` saying how many, so a caller is never silently edited.
+
 `expect=` is the current source of the cell you are replacing, as you last read
 it. Pass it: the replace is then refused if the cell has changed since, instead
 of destroying something you have not seen. `/cells` clips a long cell and marks
@@ -185,7 +190,8 @@ that cell `truncated` — never replace one of those from what you were shown.
 The bridge refuses rather than guesses. `401` without the token. `400` for a
 body that is not a JSON object, a body that produces no content — including for
 `/cell/replace`, which will not blank a cell for you — an unrecognised `kind`,
-or a `position` that is not a whole number. `404` for an unknown path, `405` for
+a `position` that is not a whole number, or a `/cell/replace` with no `index=`
+— it will not pick a cell for you. `404` for an unknown path, `405` for
 the wrong method. `409` when no notebook is open, when `notebook=` matches none
 of the open ones **or more than one** — it will not quietly write somewhere
 else, and an ambiguous hint names the candidates so you can narrow it — or when
@@ -261,14 +267,26 @@ To generate a cell, this extension sends to your chosen provider:
 Cell outputs routinely contain more than people expect: dataframe contents, file
 paths, API responses, and anything you have printed. The default is on because
 it is what makes the tool good — the model reuses your real column names instead
-of inventing them, and *Fix the Error* depends on it — but you can turn it off
-in the control panel or with `includeOutputs`.
+of inventing them — but you can turn it off in the control panel or with
+`includeOutputs`.
 
-With the **API** provider this goes to Anthropic under your API key. With the
-**Claude Code CLI** provider it goes through your existing Claude Code session —
-and note that the CLI is started *inside your workspace folder*, so Claude Code
-sees that folder path as its working directory even though the prompt itself
-carries only the file name.
+*Fix the Error* is the one exception, and a deliberate one: asking to fix an
+error **is** asking to send that error, so the traceback goes either way. With
+`includeOutputs` off it sends the traceback and nothing else — the cell's ordinary
+printed output stops.
+
+With the **API** provider this goes to Anthropic under your API key, and nothing
+else does.
+
+With the **Claude Code CLI** provider it goes through your existing Claude Code
+session, and more travels than the list above. The CLI is started *inside your
+workspace folder*, which means it behaves the way Claude Code always does there:
+**any `CLAUDE.md` that applies to the folder is part of the request**, and Claude
+Code may read other files in the folder and send their contents if answering
+needs it. If that folder holds anything you would not send to Anthropic, use the
+API provider for it, or open the notebook somewhere else. In a workspace you have
+**not** trusted, the CLI is run outside the folder instead, so neither its
+`CLAUDE.md` nor its hooks apply.
 
 If `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is exported in your shell, the
 `auto` provider uses it in preference to your Claude Code plan, and that is
@@ -276,7 +294,11 @@ billed per token. Set `provider` to `claude-cli` if you would rather it never
 did.
 
 **This extension collects no telemetry of its own.** Nothing is sent anywhere
-except the provider you chose, for a request you triggered.
+except the provider you chose, for a request you triggered — with one thing worth
+naming: while the agent bridge is running, any local program holding the token
+can read the open notebook, including cell outputs, and whatever that program
+does with what it reads is between you and it. See [The agent
+bridge](#the-agent-bridge).
 
 ## Limitations
 
@@ -302,7 +324,7 @@ except the provider you chose, for a request you triggered.
 
 ```bash
 npm ci
-npm test          # 126 tests, no VS Code needed
+npm test          # 131 tests, no VS Code needed
 npm run build     # bundle to dist/
 npm run package   # build a .vsix
 ```

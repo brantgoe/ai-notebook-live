@@ -175,12 +175,18 @@ async function stream({ target, system, user, opts, token, onText }) {
     : streamCli({ system, user, opts, token, onText, binary: target.binary });
 }
 
+// Loaded on first use, not at import: the SDK is the bulk of the bundle, and a
+// CLI-only user was paying its module initialisation on every notebook open for
+// a code path they never take. esbuild still bundles it; this only defers
+// evaluating it until the first API call - or the first API error.
+let sdkModule;
+function sdk() {
+  if (!sdkModule) sdkModule = require('@anthropic-ai/sdk');
+  return sdkModule;
+}
+
 async function streamApi({ system, user, opts, token, onText, apiKey }) {
-  // Required here, not at the top: the SDK is the bulk of the bundle, and a
-  // CLI-only user was paying its module initialisation on every notebook open
-  // for a code path they never take. esbuild still bundles it; this only
-  // defers evaluating it until the first API call.
-  const Anthropic = require('@anthropic-ai/sdk');
+  const Anthropic = sdk();
   const client = new Anthropic({ apiKey, maxRetries: 2 });
   const params = {
     model: opts.model,
@@ -230,6 +236,12 @@ async function streamApi({ system, user, opts, token, onText, apiKey }) {
 }
 
 function apiError(err) {
+  // apiError referenced `Anthropic` while the require lived inside streamApi's
+  // scope, so EVERY API failure - a bad key above all - was replaced by
+  // "Anthropic is not defined": no message, and no `action` for the "Set API
+  // Key" button the user needed. The lazy accessor keeps the deferral the
+  // comment on sdk() describes and makes the class reachable from here.
+  const Anthropic = sdk();
   if (err instanceof Anthropic.AuthenticationError) {
     return new ProviderError('Anthropic rejected the API key.', { action: 'setKey' });
   }

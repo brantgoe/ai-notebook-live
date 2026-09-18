@@ -836,12 +836,26 @@ test('nbpush --replace on a pipe replaces, and never appends', async () => {
     assert.strictEqual(notebook.cellCount, 2, 'replacing must never add a cell');
     assert.strictEqual(notebook.cellAt(1).document.getText(), 'keep = "replaced"');
     // And the routing itself: with a pipe, --replace must not reach /cell.
+    // Scoped to the stream request's OWN options object rather than a 400-char
+    // window after it. The window also covered the code that prints where the
+    // push landed, which legitimately reads args.replace to say "replaced cell
+    // N" instead of "added a cell" - so the guard failed on a change it was
+    // never meant to catch.
     const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'nbpush.js'), 'utf8');
-    const streamBranch = src.slice(src.indexOf('// Stream stdin'));
+    const streamCall = src.slice(src.indexOf("pathname: '/cell/stream'"));
+    const streamOptions = streamCall.slice(0, streamCall.indexOf('});'));
     assert.ok(
-      !/pathname: '\/cell\/stream'[\s\S]{0,400}args\.replace/.test(streamBranch),
+      !/args\.replace/.test(streamOptions),
       'the streaming branch must not be reachable with --replace'
     );
+    // The behavioural half of the same claim, which is the part that matters:
+    // a piped --replace must route to /cell/replace and carry the selector.
+    assert.match(
+      nbpush.replaceSearch(new URLSearchParams('notebook=Test_Notebook'), 3),
+      /notebook=Test_Notebook/,
+      '--notebook must survive onto the replace query'
+    );
+    assert.match(nbpush.replaceSearch(new URLSearchParams(), 3), /index=3/);
   } finally {
     await bridge.stop();
   }
@@ -1636,6 +1650,7 @@ test('the model cannot write a character the kernel could never run', async () =
   // Repaired, not refused: throwing would discard a whole generation the user
   // waited for, over something invisible.
   assert.doesNotThrow(() => validate.cellText(clean.text));
+  assert.strictEqual(validate.cellText(clean.text).repaired, 0, 'already-clean text needs no repair');
   assert.ok(clean.text.includes('x = 1') && clean.text.includes('y = 2'), 'the code survives');
 });
 
@@ -1650,14 +1665,18 @@ test('cellText matches what Python actually refuses', async () => {
   );
   // NBSP means a space and the rest mean nothing, so they are repaired rather
   // than refused - refusing throws away a whole cell over something invisible.
-  assert.strictEqual(validate.cellText('a = 1'), 'a = 1', 'NBSP becomes a space');
+  assert.strictEqual(validate.cellText('a = 1').text, 'a = 1', 'NBSP becomes a space');
+  // The count is the point of the change: the refuse path used to repair
+  // silently and return a bare string, so the bridge rewrote a push and
+  // told nobody.
+  assert.strictEqual(validate.cellText('a = 1').repaired, 1, 'and it reports the one rewrite');
   for (const [name, ch] of [
     ['soft hyphen', '­'],
     ['BOM', '﻿'],
     ['zero-width space', '​'],
     ['C1 CSI', ''],
   ]) {
-    assert.strictEqual(validate.cellText(`a${ch} = 1`), 'a = 1', `${name} is removed`);
+    assert.strictEqual(validate.cellText(`a${ch} = 1`).text, 'a = 1', `${name} is removed`);
   }
   // What genuinely cannot be repaired is still refused, with the offset named.
   assert.throws(() => validate.cellText('a b'), /control character/);
@@ -2254,7 +2273,7 @@ test('text that would poison the notebook is refused, not written', () => {
     '',
   ];
   for (const text of fine) {
-    assert.strictEqual(validate.cellText(text), text, JSON.stringify(text.slice(0, 24)));
+    assert.strictEqual(validate.cellText(text).text, text, JSON.stringify(text.slice(0, 24)));
   }
   assert.throws(() => validate.cellText(42), /must be a string/);
 });
@@ -2891,6 +2910,189 @@ test('an ambiguous notebook= is refused, never resolved to whichever came first'
     }
   } finally {
     vscode.window.activeNotebookEditor = undefined;
+  }
+});
+
+test('/cell/replace refuses a missing or blank index instead of destroying cell 0', async () => {
+  // `Number(url.searchParams.get('index'))` mapped null, '', ' ', '-0', '0x0'
+  // and '0.0' all to a valid-looking 0, so a caller that forgot the one
+  // parameter naming what it destroys silently lost cell 0 - the imports.
+  const notebook = newNotebook(['IMPORTANT = "six months of work"', 'b', 'c']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const body = JSON.stringify({ code: 'pwned = 1' });
+    for (const q of ['', 'index=', 'index=%20', 'index=-0', 'index=0x0', 'index=0.0', 'index=%2B0', 'index=1e1']) {
+      const res = await call(port, token, { path: `/cell/replace?${q}`, body });
+      assert.strictEqual(res.status, 400, `?${q} must be refused`);
+      assert.strictEqual(
+        notebook.cellAt(0).document.getText(),
+        'IMPORTANT = "six months of work"',
+        `?${q} destroyed cell 0`
+      );
+    }
+    // Saying which cell still works, including with leading zeros.
+    const ok = await call(port, token, { path: '/cell/replace?index=00', body });
+    assert.strictEqual(ok.status, 200);
+    assert.strictEqual(notebook.cellAt(0).document.getText(), 'pwned = 1');
+    assert.strictEqual(notebook.cellCount, 3, 'and replacing never adds a cell');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('a push the user typed over is refused, not run, and not reported ok', async () => {
+  // closeWriter never read writer.foreign, though extension.js has always
+  // refused to run on it. So the bridge answered ok:true for a cell holding the
+  // user's own half-typed line - and with bridge.execution 'always', ran it.
+  const notebook = newNotebook(['first']);
+  let asked = 0;
+  const notices = [];
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => {
+      asked += 1;
+      return { run: true, reason: 'set to always run' };
+    },
+    infoDir: BRIDGE_HOME,
+    notify: (kind, message) => notices.push({ kind, message }),
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const writer = await bridge.openWriter({ search: new URLSearchParams() });
+    writer.write('print("from the agent")\n');
+    await writer.flush();
+    // The human takes the cell over mid-write.
+    writer.cell().document.text = 'import os; os.system("MY OWN HALF TYPED LINE")';
+    const result = await bridge.closeWriter(writer, { search: new URLSearchParams('run=1') });
+
+    assert.strictEqual(result.ok, false, 'it must not claim success');
+    assert.strictEqual(result.foreign, true, 'and must say why');
+    assert.strictEqual(result.ran, false, 'and must not have run');
+    assert.strictEqual(asked, 0, 'the execution policy is not even consulted');
+    assert.strictEqual(
+      writer.cell().document.getText(),
+      'import os; os.system("MY OWN HALF TYPED LINE")',
+      "the user's text is left exactly as they typed it"
+    );
+    assert.ok(
+      notices.some((n) => /you edited that cell/i.test(n.message)),
+      'and the human is told their edit stopped the push'
+    );
+    assert.strictEqual(vscode.__test.executed.length, 0, 'nothing executed');
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('the bridge says when it rewrote invisible characters', async () => {
+  // cellText repaired on both paths but only RETURNED the count on the sanitize
+  // path, so a push whose NBSP was turned into a space was reported to nobody -
+  // while the model path has always logged it.
+  const notebook = newNotebook(['first']);
+  const bridge = new Bridge({
+    resolveNotebook: () => notebook,
+    decideRun: async () => ({ run: false, reason: 'test policy' }),
+    infoDir: BRIDGE_HOME,
+  });
+  const { port, token } = await bridge.start(0);
+  try {
+    const nbsp = 'df = 1';
+    const added = await call(port, token, { body: JSON.stringify({ code: nbsp }) });
+    assert.strictEqual(added.status, 200);
+    assert.strictEqual(JSON.parse(added.body).repaired, 1, '/cell reports the rewrite');
+    assert.strictEqual(notebook.cellAt(notebook.cellCount - 1).document.getText(), 'df = 1');
+
+    const replaced = await call(port, token, {
+      path: '/cell/replace?index=0',
+      body: JSON.stringify({ code: nbsp }),
+    });
+    assert.strictEqual(JSON.parse(replaced.body).repaired, 1, '/cell/replace reports it too');
+
+    // Clean code must not claim a repair that did not happen.
+    const clean = await call(port, token, { body: JSON.stringify({ code: 'x = 1' }) });
+    assert.strictEqual(JSON.parse(clean.body).repaired, undefined);
+
+    // And the streaming path must WRITE the repaired text, not the raw chunk -
+    // it validated and then wrote the original, on the one endpoint the
+    // README's `claude -p ... | nbpush` example uses.
+    const streamed = await call(port, token, {
+      path: '/cell/stream',
+      chunks: [nbsp],
+    });
+    assert.strictEqual(streamed.status, 200);
+    assert.strictEqual(
+      notebook.cellAt(notebook.cellCount - 1).document.getText(),
+      'df = 1',
+      'the streamed cell is repaired too'
+    );
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test('includeOutputs off stops Revise and Fix sending the cell output', async () => {
+  // describeCell honoured the flag; revisePrompt and fixPrompt called
+  // readOutputs unconditionally, so the ONE cell whose output is likeliest to
+  // hold a dataframe or a key was sent anyway.
+  const notebook = newNotebook(['df.head()']);
+  const cell = notebook.cellAt(0);
+  cell.outputs = [
+    {
+      items: [
+        { mime: 'text/plain', data: Buffer.from('CANARY_salary=999999 token=sk-live-abc') },
+      ],
+    },
+  ];
+  const off = { contextCells: 12, includeOutputs: false, model: 'claude-opus-5' };
+  const on = { ...off, includeOutputs: true };
+
+  const revisedOff = promptsModule.revisePrompt({ notebook, cell, instruction: 'tidy it', opts: off });
+  assert.ok(!revisedOff.user.includes('CANARY'), 'Revise must honour the switch');
+  const revisedOn = promptsModule.revisePrompt({ notebook, cell, instruction: 'tidy it', opts: on });
+  assert.ok(revisedOn.user.includes('CANARY'), 'and still send it when it is on');
+
+  // Fix keeps the traceback either way - clicking "Fix the Error" IS the
+  // request to send that error - but stdout is not part of that bargain.
+  const fixedOff = promptsModule.fixPrompt({ notebook, cell, opts: off });
+  assert.ok(!fixedOff.user.includes('CANARY'), 'Fix must not send stdout when the switch is off');
+});
+
+test('an untrusted workspace does not become the CLI working directory', async () => {
+  // The CLI is Claude Code: it runs the hooks in the folder it is started in
+  // and reads that folder's CLAUDE.md. Execution and the bridge were gated on
+  // isTrusted; the spawn was not, so declining to trust a repo still ran its
+  // hooks the first time you asked for a cell.
+  const extension = require(path.join('..', 'extension.js'));
+  const { workingDirFor } = extension.__test;
+  newNotebook(['x = 1']);
+  // Deliberately NOT under /tmp: the stub's default notebook lives there, and
+  // there the untrusted answer and the trusted answer are the same string.
+  const notebook = new vscode.NotebookDocument(
+    '/home/somebody/work/analysis.ipynb',
+    [{ kind: vscode.NotebookCellKind.Code, value: 'x = 1', languageId: 'python' }],
+    { metadata: { kernelspec: { language: 'python' } } }
+  );
+  const trusted = vscode.workspace.isTrusted;
+  try {
+    vscode.workspace.isTrusted = true;
+    assert.strictEqual(
+      workingDirFor(notebook),
+      '/home/somebody/work',
+      'a trusted folder is still used'
+    );
+    vscode.workspace.isTrusted = false;
+    assert.strictEqual(
+      workingDirFor(notebook),
+      os.tmpdir(),
+      'an untrusted folder must never be handed to the CLI'
+    );
+  } finally {
+    vscode.workspace.isTrusted = trusted;
   }
 });
 

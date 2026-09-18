@@ -361,7 +361,13 @@ async function main() {
   }
 
   if (args.list) {
-    const res = await request(info, { method: 'GET', pathname: '/cells' });
+    // Without the selector this listed whatever was focused, so an agent read
+    // indices from one notebook and replaced that index in another.
+    const res = await request(info, {
+      method: 'GET',
+      pathname: '/cells',
+      search: args.notebook ? `notebook=${encodeURIComponent(args.notebook)}` : undefined,
+    });
     if (res.status !== 200) {
       process.stderr.write(`nbpush: ${res.status} ${res.text}\n`);
       return process.exit(1);
@@ -390,7 +396,11 @@ async function main() {
     res = await request(info, {
       method: 'POST',
       pathname: args.replace !== undefined ? '/cell/replace' : '/cell',
-      search: args.replace !== undefined ? `index=${encodeURIComponent(args.replace)}` : search.toString(),
+      // Built FROM `search`, not instead of it: a fresh `index=` string dropped
+      // --notebook, so --replace rewrote whichever notebook happened to be
+      // focused - and said ok. Selecting the file and selecting the cell are
+      // two different questions and both have to reach the bridge.
+      search: replaceSearch(search, args.replace),
       body: JSON.stringify({ code }),
     });
   } else if (args.replace !== undefined) {
@@ -405,7 +415,7 @@ async function main() {
     res = await request(info, {
       method: 'POST',
       pathname: '/cell/replace',
-      search: `index=${encodeURIComponent(args.replace)}`,
+      search: replaceSearch(search, args.replace),
       body: JSON.stringify({ code }),
     });
   } else {
@@ -425,7 +435,10 @@ async function main() {
   // Where it landed goes to stderr; stdout stays machine-readable.
   try {
     const body = JSON.parse(res.text);
-    if (body.notebook) process.stderr.write(`nbpush: added a cell to ${body.notebook}\n`);
+    if (body.notebook) {
+      const what = args.replace !== undefined ? `replaced cell ${args.replace} in` : 'added a cell to';
+      process.stderr.write(`nbpush: ${what} ${body.notebook}\n`);
+    }
   } catch {
     /* the server said something we could not parse; the raw text still prints */
   }
@@ -441,4 +454,16 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, chooseInput, readInfo, alive, INFO_FILE, CliExit };
+/**
+ * The query for a /cell/replace. `index` says which cell; everything the user
+ * already chose - `notebook` above all - has to survive alongside it.
+ */
+function replaceSearch(search, index) {
+  const q = new URLSearchParams(search);
+  q.delete('kind');
+  q.delete('position');
+  q.set('index', String(index));
+  return q.toString();
+}
+
+module.exports = { parseArgs, chooseInput, readInfo, alive, INFO_FILE, CliExit, replaceSearch };

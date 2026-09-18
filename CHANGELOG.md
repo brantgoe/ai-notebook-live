@@ -7,7 +7,67 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
-## [Unreleased]
+## [0.6.2] - 2026-09-17
+
+What an eight-expert review of 0.6.1 turned up, plus adversarial probing of a
+running bridge. Ten defects, every one a case where the code did something this
+project's own README, CHANGELOG, manifest or `--help` said it did not. Nothing
+here is a new feature.
+
+### Fixed — your work
+
+- **`nbpush --replace N --notebook X` destroyed a cell in whichever notebook was
+  focused, not X.** `--notebook` was collected and then dropped: both replace
+  branches built a fresh `index=` query instead of adding to the one the user's
+  options were already in, and `--list` sent no selector at all. So an agent read
+  cell indices from one notebook and destroyed that index in another, was told
+  `ok`, and exited 0. The add path had always passed it correctly, which is why
+  this survived.
+- **`/cell/replace` with a missing or blank `index=` overwrote cell 0.**
+  `Number()` maps `null`, `''`, `' '`, `'-0'`, `'0x0'` and `'0.0'` all to a
+  valid-looking `0`, so forgetting the one parameter that names what you are
+  destroying cost you the imports. Omitting it is now its own 400.
+- **A cell you typed into mid-push was reported as successfully written, and
+  could be executed.** The writer noticed the takeover and kept your version —
+  and then `closeWriter` never read that flag, so the bridge asked the execution
+  policy anyway and answered `ok: true`. With `bridge.execution` on `always`,
+  what ran was your half-typed line. It is now a 409 that runs nothing and tells
+  you why.
+
+### Fixed — what you are told
+
+- **`includeOutputs: false` still sent the target cell's output and traceback on
+  Revise and Fix.** The context cells honoured the switch; the one cell whose
+  output is likeliest to hold a dataframe or a key did not. *Fix the Error* still
+  sends the traceback — asking to fix an error is asking to send it — but no
+  longer sends ordinary printed output, and the README now says so instead of
+  claiming the command "depends on" the switch it ignored.
+- **Every Anthropic API failure showed "Anthropic is not defined".** `apiError`
+  referenced a binding scoped inside `streamApi`, so a rejected key produced a
+  `ReferenceError` instead of the message it had written — and no `action`, so
+  the "Set API Key" button never appeared. Present in the released bytes.
+- **The bridge rewrote invisible characters in pushed code and reported
+  nothing.** A non-breaking space became a space and the caller was never told;
+  the model path had logged this all along. Responses now carry
+  `repaired: <n>`. `/cell/stream` was worse: it validated the chunk and then
+  wrote the unrepaired original, on the endpoint the README's own example uses.
+- **The approval dialog showed the first 900 characters and then ran the whole
+  cell**, ending in a bare `...` that reads like the end of the code rather than
+  a warning. It now names the real length, cuts on a line boundary, and will not
+  offer "always run these" off a preview you could not finish reading.
+- The README's Privacy section understated what the CLI provider sends: a
+  workspace `CLAUDE.md` is part of the request, and Claude Code may read other
+  files in the folder. It also claimed nothing is sent anywhere else while the
+  bridge was free to hand the notebook to any local program holding the token.
+
+### Fixed — safety
+
+- **The Claude CLI was spawned inside a workspace you had declined to trust**, so
+  that repository's `.claude` hooks ran and its `CLAUDE.md` steered the prompt —
+  `claude --print` cannot stop to ask. Execution and the bridge were both gated
+  on trust; this was the third door and it was open. Untrusted workspaces now get
+  a neutral working directory, and the manifest's Restricted Mode description no
+  longer promises more than is enforced.
 
 ### Fixed — talking to other tools
 
@@ -472,7 +532,7 @@ behind your back: destroy your code, or run code you did not agree to run.
 Initial version: stream Claude-generated code into notebook cells, revise,
 explain and fix cells, and a localhost bridge for external agents.
 
-[Unreleased]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.1...HEAD
+[0.6.2]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.4.0...v0.5.0

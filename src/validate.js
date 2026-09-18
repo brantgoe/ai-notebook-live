@@ -240,10 +240,13 @@ function cellText(value, { field = 'code', mode = 'refuse' } = {}) {
     out += value[i];
   }
   // Repaired on BOTH paths: a cell full of NBSP is no more runnable because a
-  // human sent it, and the fix is not a guess.
+  // human sent it, and the fix is not a guess. BOTH paths also report how many
+  // - the refuse path used to drop `fixed.repaired` on the floor and return a
+  // bare string, so the bridge rewrote an agent's code and told nobody. The
+  // model path (extension.js) has always logged it; a push should not be
+  // quieter than a generation.
   const fixed = repairInvisibles(out);
-  if (sanitize) return { text: fixed.text, repaired: repaired + fixed.repaired };
-  return fixed.text;
+  return { text: fixed.text, repaired: repaired + fixed.repaired };
 }
 
 module.exports = {

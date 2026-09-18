@@ -90,7 +90,12 @@ function generatePrompt({ notebook, index, instruction, opts }) {
 }
 
 function revisePrompt({ notebook, cell, instruction, opts }) {
-  const { error, text } = readOutputs(cell, { limit: 1200 });
+  // describeCell honoured includeOutputs and these two did not, so turning the
+  // switch off still shipped the target cell's stdout and traceback - the one
+  // cell whose output is likeliest to hold the dataframe you did not want sent.
+  const { error, text } = opts.includeOutputs
+    ? readOutputs(cell, { limit: 1200 })
+    : { error: '', text: '' };
   const current = [
     'The cell to rewrite:',
     '--- begin cell ---',
@@ -116,7 +121,12 @@ function revisePrompt({ notebook, cell, instruction, opts }) {
 }
 
 function fixPrompt({ notebook, cell, opts }) {
-  const { error, text } = readOutputs(cell, { limit: 2000 });
+  // Asking to fix an error is itself a request to send that error, so the
+  // traceback goes either way - saying otherwise would make the command a lie.
+  // Stdout is a different matter: nothing about "fix this" implies the
+  // dataframe printed above it, so that stops when includeOutputs is off.
+  const { error, text: stdout } = readOutputs(cell, { limit: 2000 });
+  const text = opts.includeOutputs ? stdout : '';
   return {
     system: baseSystem(notebookLanguage(notebook), opts.systemPromptExtra),
     user: [

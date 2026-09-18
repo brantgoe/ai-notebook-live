@@ -2,7 +2,7 @@
   "name": "ai-notebook-live",
   "displayName": "AI Notebook Live",
   "description": "Stream Claude-generated code straight into Jupyter notebook cells as it is written, and let other AI tools — Codex included — add cells to the notebook you have open.",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "brantgoe",
   "license": "Apache-2.0",
   "engines": {
@@ -300,7 +300,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "In an untrusted folder, generated code is never executed, the agent bridge does not start, and prompt text supplied by the workspace is ignored.",
+      "description": "In an untrusted folder, generated code is never executed, the agent bridge does not start, prompt text supplied by the workspace is ignored, and the Claude CLI is run outside the folder so its hooks and CLAUDE.md cannot take effect.",
       "restrictedConfigurations": [
         "aiNotebookLive.systemPromptExtra",
         "aiNotebookLive.provider"
