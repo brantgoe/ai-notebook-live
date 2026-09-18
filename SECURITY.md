@@ -2,9 +2,16 @@
 
 ## Reporting a problem
 
-Email **brantgoe@gmail.com** with "ai-notebook-live" in the subject. Please
-include what you did, what happened, and which version (`AI Notebook: Show Log`
-prints it on the first line).
+Use GitHub's private vulnerability reporting: go to the
+[Security tab](https://github.com/brantgoe/ai-notebook-live/security) and click
+**Report a vulnerability**. The report is visible only to the maintainer, and
+you keep a thread to follow up in.
+
+Please include what you did, what happened, and which version
+(`AI Notebook: Show Log` prints it on the first line).
+
+**Please do not open a public issue for a security bug**, and do not post a
+working exploit anywhere public before it is fixed.
 
 This is a small project maintained by one person. There is no bounty and no
 guaranteed response time, but reports are read.
