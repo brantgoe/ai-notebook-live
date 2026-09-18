@@ -1,0 +1,835 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI Notebook Live Handbook</title>
+<style>
+:root{
+  --paper:#faf8f5; --surface:#fffefc; --sunken:#f2efea;
+  --ink:#1c1b19; --ink-soft:#57534e; --ink-faint:#8b857d;
+  --rule:#e3ded6; --rule-strong:#cfc8bd;
+  --accent:#186363; --accent-soft:#e2efee; --accent-ink:#0f4747;
+  --warn:#8a6116; --warn-soft:#fbf1dd;
+  --danger:#9b2c2c; --danger-soft:#fbe9e7;
+  --ok:#2f6f4f; --ok-soft:#e6f2ea;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --paper:#17181a; --surface:#1e1f22; --sunken:#242629;
+  --ink:#e9e6e1; --ink-soft:#b0aaa2; --ink-faint:#837d75;
+  --rule:#323438; --rule-strong:#44464b;
+  --accent:#5ab3ad; --accent-soft:#16302f; --accent-ink:#8ed3ce;
+  --warn:#d9a441; --warn-soft:#2e2517;
+  --danger:#e07a6f; --danger-soft:#33201e;
+  --ok:#6fbf92; --ok-soft:#16281f;
+  color-scheme:dark;
+}}
+:root[data-theme="dark"]{
+  --paper:#17181a; --surface:#1e1f22; --sunken:#242629;
+  --ink:#e9e6e1; --ink-soft:#b0aaa2; --ink-faint:#837d75;
+  --rule:#323438; --rule-strong:#44464b;
+  --accent:#5ab3ad; --accent-soft:#16302f; --accent-ink:#8ed3ce;
+  --warn:#d9a441; --warn-soft:#2e2517;
+  --danger:#e07a6f; --danger-soft:#33201e;
+  --ok:#6fbf92; --ok-soft:#16281f;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.65 var(--sans)}
+img{max-width:100%}
+[hidden]{display:none!important}
+a{color:var(--accent);text-underline-offset:.18em}
+a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+
+.masthead{border-bottom:1px solid var(--rule);background:var(--surface)}
+.masthead-in{max-width:1180px;margin:0 auto;padding:22px 20px 20px;
+  display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+.brand h1{margin:0;font-size:1.45rem;letter-spacing:-.022em;font-weight:650;text-wrap:balance}
+.brand p{margin:5px 0 0;color:var(--ink-soft);font-size:.95rem;max-width:62ch}
+.badge{margin-left:auto;flex:none;display:inline-flex;align-items:center;gap:7px;
+  background:var(--warn-soft);color:var(--warn);border:1px solid currentColor;
+  border-radius:999px;padding:4px 12px;font:600 .74rem/1.5 var(--sans);
+  letter-spacing:.07em;text-transform:uppercase}
+.ver{font-family:var(--mono);font-size:.78rem;color:var(--ink-faint)}
+
+.shell{max-width:1180px;margin:0 auto;padding:0 20px;
+  display:grid;grid-template-columns:216px minmax(0,1fr);gap:40px;align-items:start}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);padding-block:26px;
+  max-height:100vh;overflow-y:auto}
+nav.toc h2{font:600 .7rem/1 var(--sans);letter-spacing:.11em;text-transform:uppercase;
+  color:var(--ink-faint);margin:0 0 10px}
+nav.toc h2+h2{margin-top:22px}
+nav.toc ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px}
+nav.toc a{display:block;padding:5px 9px;border-radius:5px;color:var(--ink-soft);
+  text-decoration:none;font-size:.885rem;border-left:2px solid transparent}
+nav.toc a:hover{background:var(--sunken);color:var(--ink)}
+nav.toc a.on{color:var(--accent-ink);background:var(--accent-soft);
+  border-left-color:var(--accent);font-weight:600}
+
+main{padding-block:26px 88px;min-width:0;max-width:72ch}
+section{scroll-margin-top:24px;padding-bottom:10px}
+section+section{margin-top:46px;padding-top:40px;border-top:1px solid var(--rule)}
+h2.sec{margin:0 0 4px;font-size:1.55rem;letter-spacing:-.02em;font-weight:650;text-wrap:balance}
+.sec-sub{margin:0 0 22px;color:var(--ink-soft);font-size:.97rem}
+h3{margin:30px 0 8px;font-size:1.06rem;letter-spacing:-.01em;font-weight:640;text-wrap:balance}
+h4{margin:22px 0 6px;font-size:.93rem;font-weight:650;color:var(--ink-soft);
+  letter-spacing:.03em}
+p{margin:0 0 13px}
+ul,ol.steps{margin:0 0 14px;padding-left:1.15em}
+li{margin-bottom:6px}
+code{font-family:var(--mono);font-size:.86em;background:var(--sunken);
+  padding:.12em .38em;border-radius:4px;border:1px solid var(--rule);
+  overflow-wrap:break-word}
+pre{margin:0 0 15px;background:var(--sunken);border:1px solid var(--rule);
+  border-radius:8px;padding:13px 15px;overflow-x:auto}
+pre code{background:none;border:0;padding:0;font-size:.83rem;line-height:1.6}
+kbd{font-family:var(--mono);font-size:.78em;background:var(--surface);
+  border:1px solid var(--rule-strong);border-bottom-width:2px;border-radius:5px;
+  padding:.1em .42em;white-space:nowrap}
+.scroll{overflow-x:auto;margin:0 0 16px;border:1px solid var(--rule);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:.895rem}
+th,td{text-align:left;padding:8px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{background:var(--sunken);font-weight:620;font-size:.8rem;letter-spacing:.035em;
+  text-transform:uppercase;color:var(--ink-soft);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td code{white-space:nowrap}
+
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);
+  padding:12px 15px;border-radius:0 7px 7px 0;margin:0 0 16px}
+.note.warn{border-color:var(--warn);background:var(--warn-soft)}
+.note.stop{border-color:var(--danger);background:var(--danger-soft)}
+.note p:last-child{margin-bottom:0}
+.note strong{color:var(--ink)}
+.lede{font-size:1.02rem;color:var(--ink-soft);margin-bottom:20px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));
+  gap:12px;margin:0 0 20px;padding:0;list-style:none}
+.cards a{display:block;height:100%;background:var(--surface);border:1px solid var(--rule);
+  border-radius:9px;padding:13px 15px;text-decoration:none;color:inherit}
+.cards a:hover{border-color:var(--accent);background:var(--accent-soft)}
+.cards strong{display:block;font-size:.95rem;margin-bottom:3px;color:var(--accent-ink)}
+.cards span{font-size:.85rem;color:var(--ink-soft);line-height:1.5}
+
+.sym{font-family:var(--mono);font-size:.82rem;color:var(--ink-faint);
+  letter-spacing:.04em;text-transform:uppercase;font-weight:600;
+  margin:26px 0 7px;padding-bottom:5px;border-bottom:1px solid var(--rule)}
+footer{border-top:1px solid var(--rule);background:var(--surface);
+  padding:22px 20px calc(22px + env(safe-area-inset-bottom,0px))}
+.foot-in{max-width:1180px;margin:0 auto;color:var(--ink-soft);font-size:.86rem;
+  display:flex;gap:18px;flex-wrap:wrap;align-items:center}
+.theme-btn{margin-left:auto;background:var(--sunken);color:var(--ink-soft);
+  border:1px solid var(--rule-strong);border-radius:6px;padding:5px 11px;
+  font:inherit;font-size:.82rem;cursor:pointer}
+.theme-btn:hover{border-color:var(--accent);color:var(--accent)}
+
+@media (max-width:860px){
+  .shell{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;max-height:none;padding-block:18px 0;
+    border-bottom:1px solid var(--rule)}
+  nav.toc ol{flex-direction:row;flex-wrap:wrap;gap:5px}
+  nav.toc a{border-left:0;border:1px solid var(--rule);border-radius:999px;padding:4px 11px;
+    font-size:.82rem}
+  nav.toc a.on{border-color:var(--accent)}
+  nav.toc h2{margin-bottom:7px}
+  nav.toc h2+h2{margin-top:15px}
+  main{padding-block:24px 64px}
+  .badge{margin-left:0}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;
+  scroll-behavior:auto!important}}
+html{scroll-behavior:smooth}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-in">
+    <div class="brand">
+      <h1>AI Notebook Live</h1>
+      <p>Claude writes, fixes and explains Jupyter cells in place — in the notebook you
+         already have open in VS Code, appearing as it is written.
+         <span class="ver">v0.6.2</span></p>
+    </div>
+    <span class="badge">In development</span>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="toc" aria-label="Contents">
+  <h2>Getting started</h2>
+  <ol>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#install">Installation</a></li>
+    <li><a href="#first-cell">Your first cell</a></li>
+  </ol>
+  <h2>Using it</h2>
+  <ol>
+    <li><a href="#reference">Commands &amp; settings</a></li>
+    <li><a href="#execution">Running generated code</a></li>
+  </ol>
+  <h2>Other tools</h2>
+  <ol>
+    <li><a href="#bridge">The agent bridge</a></li>
+    <li><a href="#codex">Connecting Codex</a></li>
+  </ol>
+  <h2>Reference</h2>
+  <ol>
+    <li><a href="#privacy">Privacy &amp; security</a></li>
+    <li><a href="#help">Help</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="overview">
+  <h2 class="sec">Overview</h2>
+  <p class="lede">The code appears in the cell, token by token, in the notebook you already
+    have open. Not in a side panel you copy out of, and not on disk behind a stale tab.</p>
+
+  <div class="note warn">
+    <p><strong>In development.</strong> Early, pre-1.0, and still changing between releases.
+    Settings and the bridge API can change — read the changelog before upgrading.</p>
+  </div>
+
+  <ul class="cards">
+    <li><a href="#install"><strong>Installation</strong><span>Get it running — about five minutes</span></a></li>
+    <li><a href="#first-cell"><strong>Your first cell</strong><span>Every step, start to finish</span></a></li>
+    <li><a href="#help"><strong>Help</strong><span>Something went wrong</span></a></li>
+  </ul>
+
+  <h3>What it is good at</h3>
+  <ul>
+    <li><strong>Writing a cell from a description</strong>, using your real column names —
+      because it can see the cells above it and what they printed.</li>
+    <li><strong>Fixing an error</strong> without you explaining it. It reads the traceback.</li>
+    <li><strong>Editing the live document</strong>, so <kbd>Ctrl</kbd>+<kbd>Z</kbd> works
+      normally and nothing is overwritten when you save.</li>
+  </ul>
+
+  <h3>What it will not do</h3>
+  <ul>
+    <li>Edit a notebook that is <strong>not open</strong> in VS Code. It does not touch files on disk.</li>
+    <li><strong>Run code you did not approve.</strong> Writing a cell and running a cell are
+      separate decisions.</li>
+    <li>Work with the Claude CLI <strong>on Windows</strong>. Use an API key there.</li>
+  </ul>
+
+  <p style="color:var(--ink-faint);font-size:.87rem;margin-top:24px">Not affiliated with,
+    endorsed by, or sponsored by Anthropic. Claude is a trademark of Anthropic, PBC.</p>
+</section>
+
+<section id="install">
+  <h2 class="sec">Installation</h2>
+  <p class="sec-sub">About five minutes. There is no Marketplace listing yet, so you install
+    a <code>.vsix</code> by hand.</p>
+
+  <h3>1. Check the prerequisites</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Need</th><th>Why</th><th>Check</th></tr></thead>
+    <tbody>
+      <tr><td><strong>VS Code 1.90+</strong></td><td>The notebook editing API</td><td>Code → About</td></tr>
+      <tr><td><strong>Jupyter extension</strong></td><td>Opening and running notebooks</td><td>Search <code>ms-toolsai.jupyter</code></td></tr>
+      <tr><td><strong>A Python kernel</strong></td><td>Running cells</td><td>Open a notebook → Select Kernel</td></tr>
+      <tr><td><strong>Claude Code</strong>, logged in</td><td>Where the code comes from</td><td><code>claude --version</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Without the Jupyter extension and a kernel the extension still <strong>writes</strong>
+    cells — it just cannot <strong>run</strong> them.</p>
+
+  <h3>2. Download the .vsix</h3>
+  <p>Take the newest file from the Releases page. It is named
+    <code>ai-notebook-live-&lt;version&gt;.vsix</code>.</p>
+  <div class="note">
+    <p>Releases marked <strong>Pre-release</strong> are older versions kept for history. Some
+      have known security bugs and say so at the top. Always take the one marked
+      <strong>Latest</strong>.</p>
+  </div>
+
+  <h3>3. Install it</h3>
+  <ol class="steps">
+    <li>Open the <strong>Extensions</strong> view (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd>)</li>
+    <li>Click the <strong>…</strong> menu at its top right</li>
+    <li><strong>Install from VSIX…</strong> and pick the file</li>
+    <li><strong>Reload the window</strong> when prompted</li>
+  </ol>
+  <p>Or from a terminal, in the folder you downloaded it to:</p>
+  <pre><code>code --install-extension ai-notebook-live-&lt;version&gt;.vsix</code></pre>
+  <div class="note">
+    <p>On a Mac the <code>code</code> command does not exist until you run <strong>Shell
+      Command: Install 'code' command in PATH</strong> from the command palette, so the menu
+      route is usually faster.</p>
+  </div>
+
+  <h4>Verifying what you downloaded (optional)</h4>
+  <p>Each release also carries a <code>SHA256SUMS</code>. The <code>.vsix</code> is a zip and
+    is not byte-reproducible, but the code inside it is:</p>
+  <pre><code>unzip -p ai-notebook-live-&lt;version&gt;.vsix extension/dist/extension.js | sha256sum</code></pre>
+  <p>Compare with the <code>extension/dist/extension.js</code> line in <code>SHA256SUMS</code>.
+    If they do not match, do not install it.</p>
+
+  <h3>4. Choose how it reaches a model</h3>
+  <p>Open the <strong>control panel</strong>: <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> →
+    <code>AI Notebook: Control Panel</code>, or click the ✨ <strong>AI</strong> item in the
+    status bar. It tells you which provider it found.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Route</th><th>How</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Claude Code CLI</strong> <em>(default)</em></td><td>Install Claude Code and log in</td><td>Uses your existing plan</td></tr>
+      <tr><td><strong>Anthropic API</strong></td><td><code>AI Notebook: Set Anthropic API Key</code></td><td>Billed per token</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note warn">
+    <p><strong>With <code>provider</code> on <code>auto</code>, an API key wins</strong> —
+      including one exported as <code>ANTHROPIC_API_KEY</code> or
+      <code>ANTHROPIC_AUTH_TOKEN</code> in your shell, which is easy to forget you did and is
+      billed per token. Set <code>provider</code> to <code>claude-cli</code> to always use
+      your plan.</p>
+  </div>
+  <p>The key is stored in VS Code's secret store, never in <code>settings.json</code>.</p>
+
+  <h3>5. Check it works</h3>
+  <p>Open any <code>.ipynb</code>, click a cell, press
+    <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd>. If a prompt box appears, you are ready.</p>
+
+  <h3>Updating and uninstalling</h3>
+  <p>Installs are manual, so nothing will prompt you. Download the newer <code>.vsix</code>,
+    install it the same way (add <code>--force</code> if the CLI complains), and reload. Going
+    <strong>back</strong> works identically.</p>
+  <p>To uninstall: Extensions view → gear icon → <strong>Uninstall</strong>. To remove what it
+    stored, clear the API key first, then delete <code>~/.ai-notebook-live/</code> — which
+    holds only the bridge's token file, and only if you used the bridge.</p>
+</section>
+
+<section id="first-cell">
+  <h2 class="sec">Your first cell</h2>
+  <p class="sec-sub">Every step, from an empty notebook to working code.</p>
+
+  <h3>1. Open a notebook</h3>
+  <p>Open any <code>.ipynb</code>. The extension only activates for notebooks. Look for
+    ✨ <strong>AI</strong> in the status bar — that is your sign it is awake.</p>
+  <div class="note">
+    <p>No ✨ AI? If your file opened in a plain text editor, close it and reopen with
+      <strong>Open With… → Jupyter Notebook</strong>.</p>
+  </div>
+
+  <h3>2. Pick a kernel</h3>
+  <p>Click <strong>Select Kernel</strong> at the top right. You can write cells without one,
+    but you cannot run them.</p>
+
+  <h3>3. Generate a cell</h3>
+  <p>Click the cell you want the new one to appear <em>below</em>, then press
+    <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd>. Type what you want, in plain words:</p>
+  <pre><code>load sales.csv and show the first few rows</code></pre>
+  <p>A new cell appears below your selection and fills in as the model writes.</p>
+  <div class="note">
+    <p>On models with extended thinking there can be a <strong>pause before any text
+      appears</strong>. That is normal — it is thinking, not stuck.</p>
+  </div>
+
+  <h3>4. Decide whether it runs</h3>
+  <p>By default the extension <strong>asks</strong> before running anything it wrote:
+    <strong>Run it</strong>, <strong>Always run these this session</strong>, or cancel.
+    Nothing executes without you clicking.</p>
+
+  <h3>5. Do not like it? Undo</h3>
+  <p><kbd>Ctrl</kbd>+<kbd>Z</kbd>. Everything it does is an ordinary undoable edit. Undo
+    follows the <em>stream</em>, so it steps back through the generation rather than reverting
+    it in one go — hold it down.</p>
+
+  <h3>6. Revise it</h3>
+  <p>Click the cell, press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>R</kbd>, say what to change:</p>
+  <pre><code>use a bar chart instead, and sort descending</code></pre>
+  <p>If the revision <strong>fails</strong>, your original comes back in a single undo step.</p>
+
+  <h3>7. Fix an error</h3>
+  <p>Run a cell, watch it fail, then click <strong>Fix the Error</strong> on the cell toolbar.
+    You do not have to explain what went wrong — the cell and its <strong>traceback</strong>
+    are both sent.</p>
+
+  <h3>8. Explain a cell</h3>
+  <p><strong>Explain This Cell</strong> adds a markdown explanation <em>above</em> the cell.
+    Useful for notebooks other people will read.</p>
+
+  <div class="sym">The whole loop</div>
+  <pre><code>Ctrl+Alt+G   describe a cell   → written below your selection
+Ctrl+Alt+R   revise the cell   → rewritten in place
+Fix the Error                  → reads the traceback, rewrites the cell
+Explain This Cell              → markdown explanation above it
+Ctrl+Z       undo anything</code></pre>
+
+  <h3>Making it write the way you want</h3>
+  <p><code>systemPromptExtra</code> is appended to every prompt — the single most useful
+    setting here:</p>
+  <pre><code>"aiNotebookLive.systemPromptExtra":
+  "Beginner class: keep code simple, avoid list comprehensions, comment every line."</code></pre>
+  <p>It can be set <strong>per workspace</strong>, so a teaching folder or a team repo carries
+    its own house style. It is ignored in a workspace you have not trusted.</p>
+
+  <h3>Two things worth knowing early</h3>
+  <p><strong>It sees your outputs.</strong> By default it sends the preceding cells
+    <em>and what they printed</em>, which is what lets the model use your real column names.
+    It also means dataframe contents go to the model — see
+    <a href="#privacy">Privacy &amp; security</a>.</p>
+  <p><strong>If you type while it writes, it stops.</strong> It keeps your version and leaves
+    the rest alone, and tells you it did.</p>
+</section>
+
+<section id="reference">
+  <h2 class="sec">Commands &amp; settings</h2>
+  <p class="sec-sub">Everything the extension contributes, as of v0.6.2.</p>
+
+  <h3>Commands</h3>
+  <p>All under the <strong>AI Notebook</strong> category in the command palette.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Command</th><th>Shortcut</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Generate Cell with AI…</td><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd></td><td>Describe a cell; written below the selection</td></tr>
+      <tr><td>Revise This Cell with AI…</td><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>R</kbd></td><td>Rewrites the selected cell from your instruction</td></tr>
+      <tr><td>Fix the Error in This Cell</td><td>—</td><td>Sends the cell <strong>and its traceback</strong></td></tr>
+      <tr><td>Explain This Cell</td><td>—</td><td>Adds a markdown explanation above the cell</td></tr>
+      <tr><td>Control Panel</td><td>—</td><td>Provider, execution policy, bridge state</td></tr>
+      <tr><td>Cancel AI Generation</td><td>—</td><td>Stops the stream, keeps what arrived</td></tr>
+      <tr><td>Set / Clear Anthropic API Key</td><td>—</td><td>Stored in VS Code's secret store</td></tr>
+      <tr><td>Start / Stop Local Agent Bridge</td><td>—</td><td>The localhost endpoint</td></tr>
+      <tr><td>Copy Agent Bridge Example Command</td><td>—</td><td>Ready to run, <strong>with no token in it</strong></td></tr>
+      <tr><td>Copy Setup Command for Another AI Tool</td><td>—</td><td>The MCP line for Codex</td></tr>
+      <tr><td>Show Log</td><td>—</td><td>What was sent where, and why a cell did or did not run</td></tr>
+    </tbody>
+  </table></div>
+  <p>On a Mac, <kbd>Cmd</kbd> replaces <kbd>Ctrl</kbd> in both shortcuts. <strong>Revise</strong>
+    and <strong>Explain</strong> are also on the cell toolbar; <strong>Fix the Error</strong>
+    appears there once a cell has an error to fix.</p>
+
+  <h3>Settings</h3>
+  <p>All prefixed <code>aiNotebookLive.</code></p>
+  <h4>Choosing a model</h4>
+  <div class="scroll"><table>
+    <thead><tr><th>Setting</th><th>Default</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>provider</code></td><td><code>auto</code></td><td><code>auto</code>, <code>api</code>, or <code>claude-cli</code></td></tr>
+      <tr><td><code>claudePath</code></td><td>—</td><td>Absolute path to <code>claude</code>, if not found</td></tr>
+      <tr><td><code>model</code></td><td><code>claude-opus-5</code></td><td>Try <code>claude-sonnet-5</code> for faster, cheaper cells</td></tr>
+      <tr><td><code>effort</code></td><td><code>medium</code></td><td>Reasoning effort. <strong>API only</strong></td></tr>
+      <tr><td><code>maxTokens</code></td><td><code>8000</code></td><td>Per cell. <strong>API only</strong></td></tr>
+      <tr><td><code>refusalFallback</code></td><td><code>true</code></td><td>Retry a decline on a fallback model. <strong>API only</strong></td></tr>
+      <tr><td><code>timeoutSeconds</code></td><td><code>300</code></td><td>Give up after this long with <strong>no output at all</strong>, measured from the last token</td></tr>
+    </tbody>
+  </table></div>
+  <h4>What the model is told</h4>
+  <div class="scroll"><table>
+    <thead><tr><th>Setting</th><th>Default</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>contextCells</code></td><td><code>12</code></td><td>Preceding cells sent as context; <code>-1</code> for all</td></tr>
+      <tr><td><code>includeOutputs</code></td><td><code>true</code></td><td>Send outputs and tracebacks too</td></tr>
+      <tr><td><code>systemPromptExtra</code></td><td>—</td><td>Your house style. Settable per workspace</td></tr>
+    </tbody>
+  </table></div>
+  <h4>What is allowed to run</h4>
+  <div class="scroll"><table>
+    <thead><tr><th>Setting</th><th>Default</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>execution</code></td><td><code>ask</code></td><td>Cells <strong>you</strong> asked for</td></tr>
+      <tr><td><code>bridge.execution</code></td><td><code>never</code></td><td>Cells <strong>another program</strong> pushed in</td></tr>
+      <tr><td><code>autoRun</code></td><td><code>false</code></td><td><strong>Deprecated.</strong> <code>true</code> behaves as <code>always</code></td></tr>
+      <tr><td><code>bridge.autoStart</code></td><td><code>false</code></td><td>Start the bridge when a notebook opens</td></tr>
+      <tr><td><code>bridge.port</code></td><td><code>37417</code></td><td><code>0</code> picks a free port</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Why some settings cannot be set per project</h3>
+  <p>Settings that decide <strong>execution</strong> or <strong>open a socket</strong> are
+    machine-scoped, so a repository you clone cannot change them:
+    <code>execution</code>, <code>bridge.execution</code>, <code>bridge.autoStart</code>,
+    <code>bridge.port</code>, <code>claudePath</code>, <code>autoRun</code>.</p>
+  <p>In a workspace you have <strong>not trusted</strong>,
+    <code>systemPromptExtra</code> and <code>provider</code> are ignored, generated code never
+    runs, the bridge does not start, and the Claude CLI is run outside the folder so that
+    folder's hooks and <code>CLAUDE.md</code> cannot take effect.</p>
+</section>
+
+<section id="execution">
+  <h2 class="sec">Running generated code</h2>
+  <p class="sec-sub">Writing a cell and running a cell are separate decisions, and you own
+    the second one.</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Setting</th><th>Default</th><th>Applies to</th></tr></thead>
+    <tbody>
+      <tr><td><code>aiNotebookLive.execution</code></td><td><code>ask</code></td><td>Cells <strong>you</strong> asked Claude for</td></tr>
+      <tr><td><code>aiNotebookLive.bridge.execution</code></td><td><code>never</code></td><td>Cells <strong>another program</strong> pushed in</td></tr>
+    </tbody>
+  </table></div>
+  <p>Each is <code>never</code>, <code>ask</code> or <code>always</code>.</p>
+
+  <h3>What <code>ask</code> means</h3>
+  <p>A modal dialog shows the code and waits. For your own generations you get <em>Run it</em>,
+    <em>Always run these this session</em>, or cancel.</p>
+  <p><strong>On the bridge it works differently</strong>, because an HTTP caller cannot be left
+    hanging: the caller is answered immediately with <code>pending</code>, and the dialog
+    appears afterwards. So an agent-pushed cell can run a few seconds after it arrives — or
+    never, if you say no.</p>
+  <p>There is no <em>always</em> button for agent-pushed code. One click on one agent's
+    harmless-looking cell would otherwise have approved <strong>every</strong> later push from
+    <strong>any</strong> local program for the life of the window.</p>
+  <div class="note">
+    <p>If the dialog had to clip the code to fit, it says so — <em>"Showing the first N of M
+      characters"</em> — and the <em>always</em> button is withheld. You are not asked to
+      approve forever on the strength of a cell you could not finish reading.</p>
+  </div>
+
+  <h3>An agent can ask, and never override</h3>
+  <p>A bridge caller may request execution with <code>run=1</code>, but a request can
+    <strong>only lower this decision, never raise it</strong>. If your policy says
+    <code>never</code>, <code>run=1</code> changes nothing. Nothing executes in a workspace you
+    have not trusted, whatever the settings say.</p>
+
+  <h3>If you type while it writes</h3>
+  <p>The extension gives way: streaming <strong>stops</strong>, <strong>your</strong> version
+    is kept, nothing runs, and you are told. Over the bridge the caller gets a
+    <code>409</code> rather than a success it did not earn.</p>
+
+  <h3>Revoking a session grant</h3>
+  <p>Open the control panel — <strong>Approved for this session</strong> shows the grant and
+    lets you take it back. Reloading the window also clears it.</p>
+</section>
+
+<section id="bridge">
+  <h2 class="sec">The agent bridge</h2>
+  <p class="sec-sub">A token-authenticated HTTP endpoint on <code>127.0.0.1</code> that lets
+    other tools on your machine read the open notebook and write cells into it.</p>
+
+  <div class="note stop">
+    <p><strong>Off by default.</strong> Read <a href="#privacy">Privacy &amp; security</a>
+      before turning it on.</p>
+  </div>
+
+  <h3>Why it exists</h3>
+  <p>Most tools that edit notebooks write the <code>.ipynb</code> <strong>on disk</strong>.
+    That does not appear in a tab you already have open, and is overwritten the moment you
+    save. The bridge edits the <strong>live document</strong> instead.</p>
+
+  <h3>Turning it on</h3>
+  <ol class="steps">
+    <li>Open a notebook</li>
+    <li><code>AI Notebook: Start Local Agent Bridge</code></li>
+    <li><code>AI Notebook: Copy Agent Bridge Example Command</code> gives you a working command</li>
+  </ol>
+  <pre><code>printf 'print("hello from an agent")' | node &lt;path&gt;/bin/nbpush.js</code></pre>
+  <p><code>nbpush</code> ships inside the installed extension.</p>
+
+  <h3>nbpush flags</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>--code "…"</code></td><td>Content inline, instead of stdin</td></tr>
+      <tr><td><code>--file PATH</code></td><td>Content from a file</td></tr>
+      <tr><td><code>--replace N</code></td><td><strong>Rewrite cell N</strong> instead of adding one</td></tr>
+      <tr><td><code>--notebook X</code></td><td>Which open notebook — a fragment of its path</td></tr>
+      <tr><td><code>--position P</code></td><td><code>below</code>, <code>above</code>, <code>end</code>, or a number</td></tr>
+      <tr><td><code>--kind K</code></td><td><code>code</code> or <code>markdown</code></td></tr>
+      <tr><td><code>--markdown</code>, <code>--md</code></td><td>Shorthand for <code>--kind markdown</code></td></tr>
+      <tr><td><code>--run</code> / <code>--no-run</code></td><td>Ask for it to run, or explicitly not</td></tr>
+      <tr><td><code>--list</code></td><td>Show the target notebook's cells</td></tr>
+      <tr><td><code>--health</code></td><td>Is the bridge up, and which notebook is it pointing at</td></tr>
+      <tr><td><code>--dry-run</code></td><td>Show what would be sent, send nothing</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note warn">
+    <p><code>--replace</code> <strong>destroys</strong> what was in that cell.
+      <kbd>Ctrl</kbd>+<kbd>Z</kbd> restores it, but only if you notice. Use
+      <code>--list</code> first.</p>
+  </div>
+
+  <h3>The HTTP API</h3>
+  <pre><code>GET  /health         state of the target notebook
+GET  /cells          the live contents, including unsaved edits
+POST /cell           {"code": "..."} in one shot
+POST /cell/replace   rewrite one existing cell, by ?index=
+POST /cell/stream    raw body, streamed into the cell as it arrives</code></pre>
+  <p>Authenticate with the <code>x-ai-notebook-token</code> header. The token is in
+    <code>~/.ai-notebook-live/bridge.json</code>. Query parameters go in the query string only
+    — the body carries content and nothing else.</p>
+
+  <h4>expect= — the guard worth using</h4>
+  <p>Pass the source you last read, and the replace is <strong>refused</strong> if the cell has
+    changed since, instead of destroying something you have not seen.</p>
+  <p><code>/cells</code> clips a long cell and marks it <code>truncated</code>.
+    <strong>Never replace a truncated cell from what you were shown</strong> — you do not have
+    its full text, so you cannot form a correct <code>expect</code>.</p>
+
+  <h4>Status codes</h4>
+  <div class="scroll"><table>
+    <thead><tr><th>Code</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td><code>401</code></td><td>No token, or the wrong one</td></tr>
+      <tr><td><code>400</code></td><td>Body is not a JSON object · produces no content · unrecognised <code>kind</code> · <code>position</code> not a whole number · <strong><code>/cell/replace</code> with no <code>index=</code></strong></td></tr>
+      <tr><td><code>404</code></td><td>Unknown path</td></tr>
+      <tr><td><code>405</code></td><td>Wrong method</td></tr>
+      <tr><td><code>409</code></td><td>No notebook open · <code>notebook=</code> matches <strong>none or more than one</strong> · <code>expect=</code> mismatch · <strong>you edited the cell while it was being written</strong></td></tr>
+      <tr><td><code>413</code></td><td>Body over 1 MiB</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Two behaviours worth knowing</h4>
+  <p><strong>An ambiguous <code>notebook=</code> is refused.</strong> The match is a substring
+    of the whole path, so <code>notebook=/</code> would match every open notebook. Rather than
+    pick the first, the bridge answers <code>409</code> and names the candidates.</p>
+  <p><strong>Invisible characters are repaired, and reported.</strong> A non-breaking space, or
+    a zero-width joiner inside an identifier, would make a cell the kernel cannot run. These
+    are rewritten rather than refused, and the response carries <code>repaired: &lt;n&gt;</code>
+    so a caller is never silently edited.</p>
+</section>
+
+<section id="codex">
+  <h2 class="sec">Connecting Codex</h2>
+  <p class="sec-sub">The bridge is also an MCP server, so a tool that speaks it can add cells
+    as a first-class action rather than by running a shell command.</p>
+
+  <h3>Why this matters for Codex</h3>
+  <p>Codex's extension edits notebooks <strong>on disk</strong>. A <code>.ipynb</code> written
+    on disk does not appear in a tab you already have open, and is overwritten the moment you
+    save. Going through the bridge edits the live document instead.</p>
+
+  <h3>Setup</h3>
+  <ol class="steps">
+    <li>Run <strong>AI Notebook: Copy Setup Command for Another AI Tool</strong></li>
+    <li>Paste what it gives you:
+      <pre><code>codex mcp add ai-notebook -- node &lt;path to bin/mcp-server.js&gt;</code></pre></li>
+    <li><strong>Restart Codex</strong></li>
+    <li><strong>Start the bridge</strong> before asking Codex to write</li>
+  </ol>
+
+  <h3>The four tools it gets</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>get_notebook_status</code></td><td>Which notebook is targeted, and how many cells</td></tr>
+      <tr><td><code>get_notebook_cells</code></td><td>Reads the live contents, <strong>including unsaved edits</strong></td></tr>
+      <tr><td><code>add_notebook_cell</code></td><td>Adds a cell, live — kind, position, optional request to run</td></tr>
+      <tr><td><code>replace_notebook_cell</code></td><td>Rewrites one cell by index, so an agent can correct its own work</td></tr>
+    </tbody>
+  </table></div>
+  <p>Whether an agent-written cell <strong>executes</strong> is still governed by
+    <code>bridge.execution</code>, which defaults to <code>never</code>.</p>
+</section>
+
+<section id="privacy">
+  <h2 class="sec">Privacy &amp; security</h2>
+  <p class="sec-sub">What leaves your machine, and what the bridge can reach.</p>
+
+  <h3>What is sent to generate a cell</h3>
+  <ul>
+    <li>the <strong>cells before the insertion point</strong> (<code>contextCells</code>, 12 by default)</li>
+    <li>their <strong>outputs and error tracebacks</strong>, if <code>includeOutputs</code> is on — it is by default</li>
+    <li>the notebook's <strong>file name only</strong>, never its path</li>
+    <li>the kernel language, and your instruction</li>
+  </ul>
+  <p>Cell outputs routinely contain more than people expect: dataframe contents, file paths,
+    API responses, anything you printed. The default is on because it is what makes the tool
+    good — the model reuses your real column names instead of inventing them.</p>
+
+  <h4>The one exception</h4>
+  <p><em>Fix the Error</em> always sends the <strong>traceback</strong>, even with
+    <code>includeOutputs</code> off. Asking to fix an error is asking to send that error. With
+    the setting off it sends the traceback and nothing else — the cell's ordinary printed
+    output stops.</p>
+
+  <h3>Where it goes</h3>
+  <p><strong>With the API provider</strong>, to Anthropic under your API key. Nothing else does.</p>
+  <p><strong>With the Claude Code CLI provider</strong>, through your existing Claude Code
+    session — and more travels than the list above. The CLI is started <em>inside your
+    workspace folder</em>, so it behaves the way Claude Code always does there:</p>
+  <div class="note warn">
+    <p>Any <strong><code>CLAUDE.md</code></strong> that applies to the folder is part of the
+      request, and Claude Code may <strong>read other files</strong> in the folder and send
+      their contents if answering needs it.</p>
+  </div>
+  <p>If that folder holds anything you would not send to Anthropic, use the API provider for
+    it, or open the notebook somewhere else. In a workspace you have <strong>not</strong>
+    trusted, the CLI is run outside the folder instead, so neither its <code>CLAUDE.md</code>
+    nor its hooks apply.</p>
+
+  <h3>Telemetry</h3>
+  <p><strong>This extension collects none of its own.</strong> Nothing is sent anywhere except
+    the provider you chose, for a request you triggered — with one thing worth naming: while
+    the bridge is running, any local program holding the token can read the open notebook,
+    including cell outputs.</p>
+
+  <h3>What the bridge is, and is not</h3>
+  <p><strong>It protects you from:</strong></p>
+  <ul>
+    <li><strong>The network.</strong> It binds <code>127.0.0.1</code> and is never exposed.</li>
+    <li><strong>Web pages.</strong> The token goes in a header, which forces browsers to
+      preflight; preflights are refused. Requests carrying an <code>Origin</code>, or a
+      <code>Host</code> that is not loopback, are refused too.</li>
+    <li><strong>A token in your shell history.</strong> Copyable commands never contain it, and
+      a token in the query string does not authenticate.</li>
+  </ul>
+  <p><strong>It does not protect you from</strong> any program already running as you that can
+    read <code>~/.ai-notebook-live/</code>. That program can read your notebook, add cells,
+    overwrite existing ones, and — if you have allowed it — run them. That is the point of the
+    feature, and why it is off until you turn it on.</p>
+  <p>The token file is created <code>0600</code> in a <code>0700</code> directory, with
+    <code>O_EXCL</code> so it will not follow a symlink. On Windows those modes are not
+    meaningfully enforced.</p>
+
+  <h3>Reporting a problem</h3>
+  <p>Use GitHub's private vulnerability reporting — the <strong>Report a vulnerability</strong>
+    button on the repository's Security tab. Please do not open a public issue for a security
+    bug.</p>
+</section>
+
+<section id="help">
+  <h2 class="sec">Help</h2>
+  <p class="sec-sub">Organised by what went wrong, not by which part of the code owns it.</p>
+
+  <div class="note">
+    <p><strong>Start here, always: <code>AI Notebook: Show Log</code>.</strong> It records what
+      was sent where, and why a cell did or did not run. Most questions below are answered in
+      one line of it. The first line gives the version — quote it in any bug report.</p>
+  </div>
+
+  <div class="sym">Nothing happens</div>
+  <h4>There is no ✨ AI in the status bar</h4>
+  <p>The extension only activates for Jupyter notebooks. If your <code>.ipynb</code> opened in
+    a plain text editor, reopen it with <strong>Open With… → Jupyter Notebook</strong>. The
+    item also hides when the active editor is not a notebook.</p>
+  <h4>The shortcut does nothing</h4>
+  <p><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd> only binds inside a notebook — click inside a
+    cell first. If another extension claimed the key, check <strong>Keyboard Shortcuts</strong>
+    and search <code>aiNotebookLive</code>.</p>
+
+  <div class="sym">Provider problems</div>
+  <h4>"Could not find the claude command"</h4>
+  <p>Either install Claude Code and log in, or set <code>aiNotebookLive.claudePath</code> to the
+    absolute path. The error message itself offers to set it for you. Find it with
+    <code>which claude</code>.</p>
+  <h4>It is billing my API key when I wanted my Claude plan</h4>
+  <p>With <code>provider</code> on <code>auto</code>, an API key wins — including one exported
+    in your shell. Set <code>provider</code> to <code>claude-cli</code>.</p>
+  <h4>"Anthropic rejected the API key"</h4>
+  <p>The stored key is wrong or expired. Replace it, or clear it and fall back to the CLI.</p>
+  <div class="note">
+    <p>Upgrading from v0.6.1 or earlier? Those versions showed <strong>"Anthropic is not
+      defined"</strong> for <em>every</em> API error, including a bad key. Fixed in v0.6.2 — if
+      you see that string, upgrade.</p>
+  </div>
+  <h4>The Claude CLI does not work on Windows</h4>
+  <p><strong>It is not supported there.</strong> The CLI is installed as a <code>.cmd</code>,
+    which this extension neither finds nor launches correctly, and the obvious workaround would
+    turn a launch problem into a shell-injection surface. Use an API key on Windows —
+    everything else, including the bridge and MCP server, works normally.</p>
+
+  <div class="sym">Generation problems</div>
+  <h4>It hangs with no output</h4>
+  <p>Extended thinking often pauses before any text appears. <code>timeoutSeconds</code>
+    (default 300) gives up, but that clock is measured from the <strong>last token</strong>, so
+    a long think is never interrupted — only true silence is.</p>
+  <h4>It wrote into the wrong place</h4>
+  <p>Cells are inserted <strong>below your selection</strong>. To replace instead, use
+    <em>Revise This Cell</em>.</p>
+  <h4>It stopped halfway and kept my text</h4>
+  <p>You typed into the cell while it was writing. The extension gives way on purpose — your
+    version is kept and nothing runs. Just ask again.</p>
+
+  <div class="sym">Execution problems</div>
+  <h4>It is not running anything</h4>
+  <p><code>execution</code> defaults to <code>ask</code>. The dialog is modal and may be behind
+    another window. If you pressed <kbd>Esc</kbd> earlier, that is recorded as a
+    <strong>deny for the session</strong> — reload the window, or reset it in the control
+    panel.</p>
+  <h4>Nothing runs no matter what I set</h4>
+  <p>You are in an <strong>untrusted workspace</strong>. Generated code never executes there and
+    the bridge does not start. Use <strong>Manage Workspace Trust</strong> if you mean to.</p>
+
+  <div class="sym">Bridge problems</div>
+  <h4>Everything returns 401</h4>
+  <p>The token changes every time the bridge restarts. Re-read
+    <code>~/.ai-notebook-live/bridge.json</code>, or re-copy the example command, and restart
+    any agent that cached it.</p>
+  <h4>A push returned 409</h4>
+  <div class="scroll"><table>
+    <thead><tr><th>Message mentions</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>no notebook open</td><td>Open one</td></tr>
+      <tr><td>matches <strong>more than one</strong></td><td>Your <code>notebook=</code> fragment is ambiguous — the message names the candidates. Use a longer one</td></tr>
+      <tr><td>matches <strong>none</strong></td><td>The fragment matches nothing open</td></tr>
+      <tr><td><code>expect=</code></td><td>The cell changed since you read it. Re-read and retry</td></tr>
+      <tr><td>you edited the cell</td><td>You typed into it mid-write; your version was kept</td></tr>
+    </tbody>
+  </table></div>
+  <h4>A replace returned 400</h4>
+  <p>Most often <strong>no <code>index=</code></strong>. As of v0.6.2 the bridge refuses to pick
+    a cell for you — earlier versions treated a missing index as cell <code>0</code> and
+    overwrote it.</p>
+  <h4>nbpush --replace hit the wrong notebook</h4>
+  <p>Upgrade. Before v0.6.2, <code>--replace</code> and <code>--list</code> silently ignored
+    <code>--notebook</code> and used whichever notebook was focused.</p>
+
+  <div class="sym">Still stuck?</div>
+  <ol class="steps">
+    <li><code>AI Notebook: Show Log</code> and read the last few lines</li>
+    <li>Check the changelog — it may already be fixed</li>
+    <li>Open an issue with the version, what you did, and what happened</li>
+  </ol>
+  <div class="note stop">
+    <p><strong>Security bugs go privately</strong> — the <strong>Report a vulnerability</strong>
+      button on the Security tab, not the issue tracker.</p>
+  </div>
+  <p style="color:var(--ink-soft);font-size:.9rem">This is a pre-1.0 project maintained by one
+    person. There is no guaranteed response time, but reports are read.</p>
+</section>
+
+</main>
+</div>
+
+<footer>
+  <div class="foot-in">
+    <span>AI Notebook Live <span class="ver">v0.6.2</span> — Apache-2.0</span>
+    <button class="theme-btn" id="theme-toggle" type="button">Toggle theme</button>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var links = [].slice.call(document.querySelectorAll('nav.toc a'));
+  var sections = links.map(function (a) {
+    return document.getElementById(a.getAttribute('href').slice(1));
+  });
+  function mark() {
+    var best = 0, top = 90;
+    sections.forEach(function (s, i) {
+      if (s && s.getBoundingClientRect().top <= top) best = i;
+    });
+    links.forEach(function (a, i) { a.classList.toggle('on', i === best); });
+  }
+  var queued = false;
+  addEventListener('scroll', function () {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(function () { queued = false; mark(); });
+  }, { passive: true });
+  mark();
+
+  var btn = document.getElementById('theme-toggle');
+  var root = document.documentElement;
+  try {
+    var saved = localStorage.getItem('anl-theme');
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  } catch (e) { /* private window, blocked storage - the media query still works */ }
+  btn.addEventListener('click', function () {
+    var dark = root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') &&
+        matchMedia('(prefers-color-scheme: dark)').matches);
+    var next = dark ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('anl-theme', next); } catch (e) { /* not essential */ }
+  });
+})();
+</script>
+</body>
+</html>
