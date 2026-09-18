@@ -11,12 +11,18 @@ open. Not in a side panel you copy out of, and not on disk behind a stale tab.
 There is also a localhost bridge, so other AI tools on your machine can read
 the open notebook and write cells into it. That is off by default.
 
+📖 **[Read the handbook](https://brantgoe.github.io/ai-notebook-live/)** — install,
+a first-cell walkthrough, the full settings and bridge reference, and a help page
+organised by what went wrong.
+
 > **What that means in practice.** Settings and the bridge API can still change
 > between versions, so read the [changelog](CHANGELOG.md) before you upgrade. It
 > is used daily by its author and has 131 tests behind it, but few other people
 > have run it yet, so expect rough edges. Bug reports are welcome in
-> [Issues](https://github.com/brantgoe/ai-notebook-live/issues); security
-> problems go the private route in [SECURITY.md](SECURITY.md).
+> [Issues](https://github.com/brantgoe/ai-notebook-live/issues); security problems
+> go through
+> [private vulnerability reporting](https://github.com/brantgoe/ai-notebook-live/security/advisories/new),
+> not the issue tracker.
 
 > Not affiliated with, endorsed by, or sponsored by Anthropic.
 > Claude is a trademark of Anthropic, PBC.
