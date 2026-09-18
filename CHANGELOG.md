@@ -7,6 +7,31 @@ All notable changes to AI Notebook Live are recorded here. This project follows
 Installs are manual, so nothing prompts you to upgrade — see
 [Updating](README.md#updating) for how to pick up a new version.
 
+## [0.6.3] - 2026-09-18
+
+**No code changes.** `dist/extension.js` is byte-identical to 0.6.2 — compare the
+hashes in either release's `SHA256SUMS` and they match. This release exists to
+reship two documents, one of which travels inside the `.vsix`.
+
+### Changed
+
+- **Security reports no longer go to a personal email address.** SECURITY.md
+  named one, which becomes scrapeable the moment this repository is public and
+  cannot be taken back once it is. Reports now go through GitHub's private
+  vulnerability reporting — maintainer-only, and the reporter keeps a thread to
+  follow up in. SECURITY.md ships *inside* the extension, so the old address was
+  in every `.vsix` ever published; this is the first build without it.
+
+### Added
+
+- **A handbook**, in `docs/`, served by GitHub Pages. Nine sections: install,
+  a first-cell walkthrough, the full command and setting reference, the
+  execution policy, the agent bridge and its HTTP contract, the Codex
+  integration, privacy, and a help page organised by symptom rather than by
+  which module owns the fault. One self-contained file with no external
+  requests, so it also opens from disk in a clone with no network. It is
+  excluded from the `.vsix`, which is unchanged at 10 files.
+
 ## [0.6.2] - 2026-09-17
 
 What an eight-expert review of 0.6.1 turned up, plus adversarial probing of a
@@ -532,6 +557,7 @@ behind your back: destroy your code, or run code you did not agree to run.
 Initial version: stream Claude-generated code into notebook cells, revise,
 explain and fix cells, and a localhost bridge for external agents.
 
+[0.6.3]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/brantgoe/ai-notebook-live/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/brantgoe/ai-notebook-live/compare/v0.5.0...v0.6.0
